@@ -10,7 +10,7 @@ import type {
   SelectListTheme,
   TerminalColorScheme,
 } from '@earendil-works/pi-tui'
-import type { PresetColor, ThemePreset } from './theme-presets.ts'
+import type { PresetColor, PresetColorRole, ThemePreset } from './theme-presets.ts'
 
 /**
  * Text carrying exactly one palette color. Branded so the compiler rejects
@@ -56,6 +56,10 @@ export interface Palette {
   success: ColorRole
   warning: ColorRole
   error: ColorRole
+  /** Permission prompts and inline code, CC's permission blue (reserved until the permission UI lands). */
+  permission: ColorRole
+  /** Plan-mode surfaces, CC's plan teal (reserved until the plan chip lands). */
+  plan: ColorRole
   code: ColorRole
   bold: AttributeRole
   italic: AttributeRole
@@ -66,7 +70,7 @@ export interface Palette {
 }
 
 /** Names of the palette's color roles, in the order `/palette` prints them. */
-export const COLOR_ROLES = ['text', 'dim', 'accent', 'brand', 'code', 'success', 'warning', 'error'] as const
+export const COLOR_ROLES = ['text', 'dim', 'accent', 'brand', 'code', 'success', 'warning', 'error', 'permission', 'plan'] as const
 
 /** One color role's name. */
 export type ColorRoleName = typeof COLOR_ROLES[number]
@@ -125,6 +129,11 @@ export function paletteSpec(scheme: TerminalColorScheme): {
       success: { open: '32', close: '39', purpose: 'Succeeded calls, and a diff\'s added lines' },
       warning: { open: '33', close: '39', purpose: 'Pending calls and warnings' },
       error: { open: '31', close: '39', purpose: 'Failures, signals, and a diff\'s removed lines' },
+      // Semantic roles mirroring Claude Code's theme: permission's bright blue
+      // and plan's white-on-dark teal. No consumer yet — defined so presets can
+      // theme them before the surfaces land.
+      permission: { open: '94', close: '39', purpose: 'Permission prompts and inline code' },
+      plan: { open: '37', close: '39', purpose: 'Plan-mode surfaces' },
     },
     attributes: {
       bold: { open: '1', close: '22', purpose: 'Emphasis; composes with any color' },
@@ -181,12 +190,20 @@ export function createPalette(
  * The role spec for one scheme with optional preset overrides applied — the
  * single resolution path shared by {@link createPalette} and `/palette`.
  */
+/** Whether a preset color key names a live palette role (reserved tokens do not). */
+function isColorRoleName(name: string): name is ColorRoleName {
+  return (COLOR_ROLES as readonly string[]).includes(name)
+}
+
 function resolveSpec(scheme: TerminalColorScheme, options: PaletteOptions): ReturnType<typeof paletteSpec> {
   const base = paletteSpec(scheme)
   const { preset, truecolor } = options
   if (preset === undefined) return base
   const colors = { ...base.colors } as Record<ColorRoleName, RoleSpec>
-  for (const [role, color] of Object.entries(preset.colors) as [ColorRoleName, PresetColor][]) {
+  for (const [role, color] of Object.entries(preset.colors) as [PresetColorRole, PresetColor][]) {
+    // Reserved keys (the diff word-level colors) are defined ahead of their
+    // palette wiring and stay inert until a palette role exists for them.
+    if (!isColorRoleName(role)) continue
     const attribute = color.truecolorAttribute
     colors[role] = {
       open: truecolor === true
@@ -276,24 +293,38 @@ export function gradientText(text: string): string {
  */
 export function markdownTheme(palette: Palette, highlightCode?: (code: string, lang?: string) => string[]): MarkdownTheme {
   return {
-    heading: text => palette.accent(text),
+    // Claude Code's heading form: bold (plus underline on h1), never colored.
+    // pi-tui's Markdown renderer applies that bold itself around this callback,
+    // which only contributes color — so the identity keeps headings uncolored.
+    // The theme callback carries no heading level, so h1's extra underline is
+    // the renderer's own and cannot be themed per level from here.
+    heading: text => text,
     link: text => palette.accent(text),
     // pi-tui requires this URL slot but its current Markdown renderer does not invoke it.
     /* v8 ignore next */
     linkUrl: text => palette.dim(text),
-    code: text => palette.code(text),
+    // Inline code takes the blue emphasis family (CC paints it permission
+    // blue); blocks keep the dedicated code role under the syntax highlighter.
+    code: text => palette.accent(text),
     codeBlock: text => palette.code(text),
     ...(highlightCode !== undefined ? { highlightCode } : {}),
     // pi-tui presents both fence rows through this callback. Keep the opening
     // language label, but hide Markdown syntax and the otherwise-empty close.
     codeBlockBorder: text => palette.dim(text.slice(3)),
-    quote: text => palette.dim(text),
-    quoteBorder: text => palette.accent(text),
+    // CC quotes: italic body at normal brightness, dim `▎` bar. pi-tui hardcodes
+    // the `│ ` border string but routes it through this callback, so the bar
+    // glyph is swapped here rather than in the renderer.
+    quote: text => palette.italic(text),
+    quoteBorder: text => palette.dim(text.replace('│', '▎')),
     hr: text => palette.dim(text),
     listBullet: text => palette.accent(text),
     bold: text => palette.bold(text),
     italic: text => palette.italic(text),
-    strikethrough: text => palette.strike(text),
+    // Strikethrough renders as plain text: models write `~` for approximations
+    // far more often than they mean to strike. pi-tui offers no parse toggle
+    // (its Markdown options only preserve list markers and backslash escapes),
+    // so the theme callback passes the content through unstruck.
+    strikethrough: text => text,
     underline: text => palette.underline(text),
   }
 }

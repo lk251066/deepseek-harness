@@ -288,12 +288,26 @@ export interface QuestionSelection {
   custom?: string
 }
 
+/** Frame shape {@link renderDialog} draws around a dialog body. */
+export interface RenderDialogOptions {
+  /**
+   * `round` (the default) draws the full rounded border for strong-interruption
+   * dialogs — approvals, confirmations, pickers. `topline` draws Claude Code's
+   * browse-pane form instead: a bold title over one full-width accent rule,
+   * content padded two columns, and no surrounding border.
+   */
+  readonly frame?: 'round' | 'topline'
+}
+
 /**
- * Render a bordered dialog frame around body lines with a titled top edge.
- * @param title - Dialog title shown in the top border.
+ * Render a dialog frame around body lines: by default a rounded border with a
+ * titled top edge, or — with `options.frame: 'topline'` — Claude Code's
+ * browse-pane form of a bold title over one full-width accent rule.
+ * @param title - Dialog title shown in the frame.
  * @param body - Body lines.
  * @param width - Dialog width in columns.
  * @param palette - Active role palette.
+ * @param options - Frame selection; defaults to the rounded border.
  * @returns The framed dialog lines.
  */
 export function renderDialog(
@@ -301,8 +315,23 @@ export function renderDialog(
   body: readonly string[],
   width: number,
   palette: Palette,
+  options: RenderDialogOptions = {},
 ): string[] {
   const innerWidth = Math.max(1, width - 4)
+  if (options.frame === 'topline') {
+    const lines: string[] = [
+      // Claude Code's Pane: one blank row of padding above, a bold title, then
+      // a single full-width rule in the accent color and no other chrome.
+      '',
+      palette.bold(displayText(title)),
+      palette.accent('─'.repeat(Math.max(0, width))),
+    ]
+    for (const line of body) {
+      const clipped = truncateToWidth(line, innerWidth, '')
+      lines.push(`  ${clipped}`)
+    }
+    return lines
+  }
   const topLabel = ` ${displayText(title)} `
   const top = `╭${topLabel}${'─'.repeat(Math.max(0, width - visibleWidth(topLabel) - 2))}╮`
   const lines: string[] = [palette.accent(top)]
@@ -566,7 +595,7 @@ export class DetailsDialog implements Component {
       ...this.list.render(innerWidth),
       '',
       this.palette.dim('↑/↓ move • Tab toggle • Enter/Esc close'),
-    ], width, this.palette)
+    ], width, this.palette, { frame: 'topline' })
   }
 }
 
@@ -578,7 +607,8 @@ export interface ThemeChoice {
 }
 
 /**
- * A read-only framed dialog over pre-rendered lines: Esc/Ctrl+C/q closes,
+ * A read-only browse dialog over pre-rendered lines, framed by a bold title
+ * over one full-width rule (Claude Code's pane form): Esc/Ctrl+C/q closes,
  * `r` recomputes the body through {@link refresh} when supplied. Backs
  * `/context`, `/agents`, `/jobs`, and `/settings`.
  */
@@ -609,7 +639,7 @@ export class StaticDialog implements Component {
     const innerWidth = Math.max(1, width - 4)
     const body = [...this.lines, '', this.palette.dim(this.refresh === undefined ? 'Esc close' : 'r refresh • Esc close')]
     return renderDialog(this.title, body.flatMap(line =>
-      line === '' ? [''] : truncateToWidth(line, innerWidth, '')), Math.min(width, 76), this.palette)
+      line === '' ? [''] : truncateToWidth(line, innerWidth, '')), Math.min(width, 76), this.palette, { frame: 'topline' })
   }
 }
 
@@ -831,7 +861,7 @@ export class ApprovalDialog implements Component {
 }
 
 /**
- * The `/theme` picker: a bordered select list over the shipped presets. Tab
+ * The `/theme` picker: a top-rule pane over the shipped presets. Tab
  * applies the highlighted theme immediately as a live preview behind the
  * dialog; Enter keeps it and closes; Esc/Ctrl+C restores the entry theme.
  */
@@ -895,7 +925,7 @@ export class ThemeDialog implements Component {
       ...this.list.render(innerWidth),
       '',
       this.palette.dim('↑/↓ move • Tab preview • Enter keep • Esc restore'),
-    ], width, this.palette)
+    ], width, this.palette, { frame: 'topline' })
   }
 }
 

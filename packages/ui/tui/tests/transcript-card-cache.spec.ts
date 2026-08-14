@@ -5,6 +5,7 @@ import { ContextCardComponent, ToolCardComponent } from '../src/components/trans
 import { TOOL_SETTLED } from '../src/components/figures.ts'
 import { parseArguments } from '../src/components/content.ts'
 import { createPalette, markdownTheme } from '../src/components/theme.ts'
+import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
 const palette = createPalette(false)
 const mdTheme = markdownTheme(palette)
@@ -74,5 +75,50 @@ describe('transcript card render caches', () => {
     expect(reRendered).toEqual(expanded)
 
     expect(card.render(60)).not.toBe(reRendered)
+  })
+
+  it('diff card: caches guttered rows by width and recomputes them on the result', () => {
+    // A diff presenter whose view the result keeps (the same object), so the
+    // re-render proves the body cache dropped rather than a new view arriving.
+    const view = {
+      card: 'diff' as const,
+      title: 'Edit a.ts',
+      diffs: [{ path: 'a.ts', oldText: 'old\nkeep', newText: 'new\nkeep' }],
+    }
+    const definition: ToolDefinition = {
+      name: 'edit',
+      description: '',
+      parameters: {},
+      output: { schema: { type: 'null' }, render: () => [] },
+      execute: async () => [],
+      presentCall: () => view,
+      presentResult: () => view,
+    }
+    const card = new ToolCardComponent(
+      'edit',
+      parseArguments('{}'),
+      definition,
+      10,
+      2_000,
+      palette,
+      // The Markdown theme carries the diff-row highlight hook; without one the
+      // rows fall back to whole-line side colors, which is what this palette
+      // renders anyway (color off).
+      markdownTheme(palette),
+    )
+    const first = card.render(80)
+    // Guttered hunk rows and the bold-counts footer (plain under color off).
+    expect(first.join('\n')).toContain('   1- old')
+    expect(first.join('\n')).toContain('   1+ new')
+    expect(first.join('\n')).toContain('   2  keep')
+    expect(first.join('\n')).toContain('└ +1 · -1 · 1 file')
+    expect(card.render(80)).toBe(first)
+
+    card.updateResult(toolResult('done'))
+    const settled = card.render(80)
+    expect(settled.join('\n')).toContain('   1- old')
+    // Same width, new rows: the result dropped the cached body.
+    expect(settled).not.toBe(first)
+    expect(card.render(80)).toBe(settled)
   })
 })

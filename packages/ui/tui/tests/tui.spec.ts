@@ -60,6 +60,13 @@ const UNUSED_TOOL_OUTPUT: ToolDefinition['output'] = {
   render: () => [],
 }
 
+/**
+ * Strip CSI SGR sequences, so diff-body assertions hold whichever way a row
+ * was styled (fallback whole-line color, or per-marker + syntax-highlight
+ * spans once the lazy highlighter lands mid-test).
+ */
+const stripSgr = (text: string): string => text.replaceAll(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+
 let nextInboxItem = 0
 
 /** Wrap one test message in the production inbox occurrence envelope. */
@@ -5247,12 +5254,16 @@ describe('tool cards and surface replay', () => {
     expect(result.terminal.output).toContain('world')
     expect(result.terminal.output).toContain('Tool and context cards expanded.')
     expect(result.terminal.output).not.toContain('tools:expanded')
-    expect(result.terminal.output).toContain('+ created')
+    // Diff rows carry a line-number gutter now, and their marker/content SGR
+    // placement depends on whether the lazy highlighter has landed, so the row
+    // assertions run on SGR-stripped output.
+    const diffPlain = stripSgr(result.terminal.output)
+    expect(diffPlain).toContain('+ created')
     expect(result.terminal.output).toContain('console')
     // The multi-file diff's second-file change and its footer surface once
     // expanded (`+ after` is b.txt's new text; the footer counts both files).
-    expect(result.terminal.output).toContain('+ after')
-    expect(result.terminal.output).toContain('· 2 files')
+    expect(diffPlain).toContain('+ after')
+    expect(diffPlain).toContain('· 2 files')
 
     // Third Ctrl+O phase hides every tool card: after a redraw the repainted
     // frame carries no tool header at all, only the conversation.
@@ -5309,12 +5320,16 @@ describe('tool cards and surface replay', () => {
     // shows exactly once (in the header).
     expect(output).toContain('○ Editing src/only.ts')
     expect(output.split('src/only.ts').length - 1).toBe(1)
-    expect(output).toContain('  my: my-MM')
-    expect(output).not.toContain('- my: my-MM')
-    expect(output).not.toContain('+ my: my-MM')
-    expect(output).toContain('- nb: no-NO')
-    expect(output).toContain('+ nb: nb-NO')
-    expect(output).toContain('└ +1 -1 · 1 file')
+    // The hunks carry line-number gutters (`new`-side numbers for context
+    // rows) and their SGR placement varies with the lazy highlighter, so the
+    // row assertions read the SGR-stripped output.
+    const hunks = stripSgr(output)
+    expect(hunks).toContain('  my: my-MM')
+    expect(hunks).not.toContain('- my: my-MM')
+    expect(hunks).not.toContain('+ my: my-MM')
+    expect(hunks).toContain('- nb: no-NO')
+    expect(hunks).toContain('+ nb: nb-NO')
+    expect(hunks).toContain('└ +1 · -1 · 1 file')
     await dispose(result)
   })
 
@@ -5350,7 +5365,7 @@ describe('tool cards and surface replay', () => {
     await tick()
     const rows = result.terminal.output.split('\n').map(row => row.trim())
     expect(result.terminal.output).toContain('empty.txt')
-    expect(result.terminal.output).toContain('└ +0 -0 · 1 file')
+    expect(result.terminal.output).toContain('└ +0 · -0 · 1 file')
     expect(rows).not.toContain('+')
     await dispose(result)
   })
@@ -5407,7 +5422,7 @@ describe('tool cards and surface replay', () => {
     expect(result.terminal.output).toContain('[exact line diff omitted: >1 changed lines]')
     expect(result.terminal.output).toContain('- old one')
     expect(result.terminal.output).toContain('+ new one')
-    expect(result.terminal.output).toContain('└ +2 -2 · 1 file · approximate')
+    expect(result.terminal.output).toContain('└ +2 · -2 · 1 file · approximate')
     const readsAfterFirstRender = oldTextReads
     expect(readsAfterFirstRender).toBeGreaterThan(0)
     result.session.append('tool/result', {
@@ -5445,16 +5460,20 @@ describe('tool cards and surface replay', () => {
     await tick()
     const output = result.terminal.output
     // Three hunks, one path: distinct-path count, same as the Web DiffBlock.
-    expect(output).toContain('· 1 file')
-    expect(output).not.toContain('· 3 files')
+    // Row and footer assertions read SGR-stripped output: the rows carry
+    // line-number gutters and the footer bolds its counts, so the styled
+    // output interleaves escapes inside those substrings.
+    const hunks = stripSgr(output)
+    expect(hunks).toContain('· 1 file')
+    expect(hunks).not.toContain('· 3 files')
     // The `first\n`/`second\n` sides each contribute exactly one added line —
     // the trailing newline terminates rather than adding a phantom empty `+ `.
-    expect(output).toContain('+ first')
-    expect(output).toContain('+ second')
+    expect(hunks).toContain('+ first')
+    expect(hunks).toContain('+ second')
     // The third hunk removes `gone` and leaves an empty added side, which
     // contributes no `+ ` row (diffContentLines('') is zero lines).
-    expect(output).toContain('- gone')
-    expect(output).toContain('+2 -1')
+    expect(hunks).toContain('- gone')
+    expect(hunks).toContain('+2 · -1')
     await dispose(result)
   })
 

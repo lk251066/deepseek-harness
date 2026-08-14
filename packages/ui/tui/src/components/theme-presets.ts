@@ -2,11 +2,20 @@
  * Named color presets for `/theme`. Each preset overrides palette color roles
  * with fixed RGB values painted as 24-bit SGR on truecolor terminals, falling
  * back to a hand-picked standard-ANSI code otherwise; the `deepseek` default
- * overrides nothing so the terminal's own 16-color scheme stays authoritative.
+ * keeps the terminal's own 16-color scheme authoritative for every adaptive
+ * role, overriding only the fixed CC-derived semantic colors every preset
+ * shares (permission, plan, and the reserved diff word tokens).
  * @module @deepseek-ai/dsh-tui/components/theme-presets
  */
 
 import type { ColorRoleName } from './theme.ts'
+
+/**
+ * Keys a preset may color: the palette's live roles plus reserved tokens that
+ * are defined ahead of their wiring (the diff word-level colors) and stay inert
+ * until a palette role exists for them.
+ */
+export type PresetColorRole = ColorRoleName | 'diffAddedWord' | 'diffRemovedWord'
 
 /** One role's preset color: exact RGB for truecolor, nearest ANSI code otherwise. */
 export interface PresetColor {
@@ -27,7 +36,7 @@ export interface ThemePreset {
   /** Whether the palette assumes a dark terminal background. */
   readonly dark: boolean
   /** Per-role overrides; roles absent keep the adaptive 16-color spec. */
-  readonly colors: Partial<Record<ColorRoleName, PresetColor>>
+  readonly colors: Partial<Record<PresetColorRole, PresetColor>>
 }
 
 /** Relative dim fallback: faint attribute over the default foreground, on any scheme. */
@@ -39,13 +48,33 @@ const dimColor = (rgb: readonly [number, number, number]): PresetColor => ({
 })
 
 /**
+ * Semantic roles copied from Claude Code's theme, identical in every preset
+ * (the presets are all dark, so the dark values apply): permission's blue and
+ * plan's teal.
+ */
+const permissionColor: PresetColor = { rgb: [87, 105, 247], ansi16: '94' }
+const planColor: PresetColor = { rgb: [72, 150, 140], ansi16: '37' }
+
+/** Reserved diff word-level tokens (CC's values), defined but not yet wired to the palette. */
+const diffAddedWordColor: PresetColor = { rgb: [56, 166, 96], ansi16: '32' }
+const diffRemovedWordColor: PresetColor = { rgb: [179, 89, 107], ansi16: '31' }
+
+/** The semantic roles and reserved diff tokens every preset carries. */
+const semanticColors = {
+  permission: permissionColor,
+  plan: planColor,
+  diffAddedWord: diffAddedWordColor,
+  diffRemovedWord: diffRemovedWordColor,
+} as const
+
+/**
  * The shipped themes, in picker order. `deepseek` is the adaptive default.
  */
 export const THEME_PRESETS: Readonly<Record<string, ThemePreset>> = {
   deepseek: {
     description: 'Adaptive DeepSeek — the terminal\'s own 16-color scheme',
     dark: false,
-    colors: {},
+    colors: { ...semanticColors },
   },
   dracula: {
     description: 'Dracula — purple accent on deep night',
@@ -58,6 +87,7 @@ export const THEME_PRESETS: Readonly<Record<string, ThemePreset>> = {
       warning: { rgb: [241, 250, 140], ansi16: '33' },
       error: { rgb: [255, 85, 85], ansi16: '31' },
       dim: dimColor([98, 114, 164]),
+      ...semanticColors,
     },
   },
   nord: {
@@ -71,6 +101,7 @@ export const THEME_PRESETS: Readonly<Record<string, ThemePreset>> = {
       warning: { rgb: [235, 203, 139], ansi16: '33' },
       error: { rgb: [191, 97, 106], ansi16: '31' },
       dim: dimColor([97, 110, 136]),
+      ...semanticColors,
     },
   },
   'catppuccin-mocha': {
@@ -84,6 +115,19 @@ export const THEME_PRESETS: Readonly<Record<string, ThemePreset>> = {
       warning: { rgb: [249, 226, 175], ansi16: '33' },
       error: { rgb: [243, 139, 168], ansi16: '31' },
       dim: dimColor([147, 153, 178]),
+      ...semanticColors,
+    },
+  },
+  daltonism: {
+    description: 'Daltonism — green roles shifted to blue',
+    dark: true,
+    colors: {
+      // The adaptive scheme with every green role moved to blue: success (and
+      // the diff's added lines through it) plus the reserved added-word token.
+      // Warning and error keep the adaptive hues.
+      ...semanticColors,
+      success: { rgb: [51, 153, 255], ansi16: '38;5;75' },
+      diffAddedWord: { rgb: [51, 153, 255], ansi16: '38;5;75' },
     },
   },
 }

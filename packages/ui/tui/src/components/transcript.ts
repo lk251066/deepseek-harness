@@ -73,6 +73,31 @@ interface RenderedDiff {
   approximate: boolean
 }
 
+/** Context rows kept at each edge of a long unchanged run before its middle folds. */
+export const DIFF_CONTEXT_LINES = 3
+
+/** Total diff rows one file may render before the middle folds away. */
+export const DIFF_MAX_RENDER_LINES = 60
+
+/** pi-tui's code-fence hook shape, which {@link renderDiff} reuses for diff rows. */
+export type DiffHighlight = (code: string, lang?: string) => string[]
+
+/**
+ * One diff body row before styling: which side it belongs to, its line number
+ * on that side (the new side for context rows — one gutter column, Claude
+ * Code's convention), and its content, display-escaped and carrying syntax SGR
+ * when the highlighter applied.
+ */
+interface DiffRow {
+  readonly kind: 'added' | 'removed' | 'context' | 'fold'
+  /** The row's line number; `0` for fold rows, which carry none. */
+  readonly line: number
+  /** Display-escaped content (for fold rows, the fold note itself). */
+  readonly content: string
+  /** Whether `content` carries syntax-highlight SGR rather than plain text. */
+  readonly highlighted: boolean
+}
+
 /**
  * A side's content lines under the terminator rule the Web DiffBlock also
  * applies: empty text is zero lines, a trailing newline terminates the last
@@ -85,52 +110,180 @@ function diffContentLines(text: string): string[] {
 }
 
 /**
- * A file diff whose unchanged context stays neutral and does not affect exact
- * change totals. Comparisons beyond the edit-distance budget fall back to
- * whole-side rendering so a model-authored pending edit cannot stall the TUI.
+ * The highlight language for a diff path: its lowercased extension, when the
+ * final path segment carries one. The highlighter itself passes unknown
+ * languages through, so no alias table is needed here.
  */
-function renderDiff(
+function diffLanguage(path: string): string | undefined {
+  const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  const dot = path.slice(slash + 1).lastIndexOf('.')
+  if (dot < 1) return undefined
+  const extension = path.slice(slash + dot + 2).toLowerCase()
+  return extension === '' ? undefined : extension
+}
+
+/**
+ * Syntax-highlight one change block's rows through the injected hook. The
+ * highlighter's own gating (color off, unknown language, module not yet
+ * loaded, oversized input) returns the rows unchanged, which callers detect
+ * row by row to fall back to the plain single-color rendering; a row-count
+ * mismatch (a defensive invariant — the hook splits the same text it is
+ * given) is treated the same way.
+ */
+function highlightRows(
+  plain: readonly string[],
+  language: string | undefined,
+  highlight: DiffHighlight | undefined,
+): readonly string[] | undefined {
+  if (highlight === undefined || language === undefined) return undefined
+  const highlighted = highlight(plain.join('\n'), language)
+  return highlighted.length === plain.length ? highlighted : undefined
+}
+
+/**
+ * Fold oversized diff rows: the middle of any unchanged run longer than
+ * {@link DIFF_CONTEXT_LINES} on both sides collapses to one dim note (added
+ * and removed rows are never dropped by this pass), and a diff still longer
+ * than {@link DIFF_MAX_RENDER_LINES} keeps head and tail halves with the
+ * middle collapsed the same way.
+ */
+function foldDiffRows(rows: readonly DiffRow[]): DiffRow[] {
+  const collapsed: DiffRow[] = []
+  let run: DiffRow[] = []
+  const flushRun = (): void => {
+    if (run.length > 2 * DIFF_CONTEXT_LINES) {
+      collapsed.push(...run.slice(0, DIFF_CONTEXT_LINES))
+      collapsed.push({
+        kind: 'fold',
+        line: 0,
+        content: `⋯ ${run.length - 2 * DIFF_CONTEXT_LINES} unchanged lines`,
+        highlighted: false,
+      })
+      collapsed.push(...run.slice(-DIFF_CONTEXT_LINES))
+    } else {
+      collapsed.push(...run)
+    }
+    run = []
+  }
+  for (const row of rows) {
+    if (row.kind === 'context') run.push(row)
+    else {
+      flushRun()
+      collapsed.push(row)
+    }
+  }
+  flushRun()
+  if (collapsed.length <= DIFF_MAX_RENDER_LINES) return collapsed
+  const keep = Math.floor(DIFF_MAX_RENDER_LINES / 2)
+  return [
+    ...collapsed.slice(0, keep),
+    { kind: 'fold', line: 0, content: `⋯ ${collapsed.length - 2 * keep} lines`, highlighted: false },
+    ...collapsed.slice(-keep),
+  ]
+}
+
+/**
+ * Style folded diff rows for the terminal: a dim, right-aligned line-number
+ * gutter sized to the largest rendered line (`max(4, digits + 2)` columns),
+ * then the side marker and content. A highlighted row keeps its syntax colors
+ * and colors only the marker (SGR has no color stack, so marker and content
+ * colors must not nest); a plain row keeps the pre-highlighter look of one
+ * color across marker and content.
+ */
+function renderDiffRows(rows: readonly DiffRow[], palette: Palette): string[] {
+  const maxLine = rows.reduce((max, row) => Math.max(max, row.line), 0)
+  const gutterWidth = Math.max(4, String(maxLine).length + 2)
+  return rows.map((row) => {
+    if (row.kind === 'fold') {
+      return `${' '.repeat(gutterWidth + 2)}${palette.dim(row.content)}`
+    }
+    const gutter = palette.dim(String(row.line).padStart(gutterWidth))
+    if (row.highlighted) {
+      const marker = row.kind === 'added' ? palette.success('+') : row.kind === 'removed' ? palette.error('-') : ' '
+      return `${gutter}${marker} ${row.content}`
+    }
+    const body = row.kind === 'added'
+      ? palette.success(`+ ${row.content}`)
+      : row.kind === 'removed'
+        ? palette.error(`- ${row.content}`)
+        : palette.dim(`  ${row.content}`)
+    return `${gutter}${body}`
+  })
+}
+
+/**
+ * A file diff rendered as terminal rows in the Claude Code shape: a dim
+ * line-number gutter (new-side numbers for added and context rows, old-side
+ * for removed), syntax-highlighted row content when a highlighter is
+ * available, long unchanged runs and oversized diffs folded to dim `⋯` notes,
+ * and unchanged context that stays neutral and does not affect exact change
+ * totals. Comparisons beyond the edit-distance budget fall back to whole-side
+ * rendering so a model-authored pending edit cannot stall the TUI.
+ */
+export function renderDiff(
   diff: FileDiff,
   maxDiffEditLength: number,
   palette: Palette,
   skipPathHeader = false,
+  highlight?: DiffHighlight,
 ): RenderedDiff {
   // The card header names the call (settled verb title); a single-file diff
   // whose title already carries the path skips the body's path header, while a
   // multi-file diff keeps one path header per file.
   const lines = skipPathHeader ? [] : [palette.bold(displayText(diff.path))]
+  const language = diffLanguage(diff.path)
+  const rows: DiffRow[] = []
   let added = 0
   let removed = 0
+  let oldLine = 0
+  let newLine = 0
+  let approximate = false
+
+  /**
+   * Append one change block's lines as rows of `kind`, consuming the side
+   * counters as the Web DiffBlock would (removed consumes old, added consumes
+   * new, context consumes both and displays its new-side number).
+   */
+  const push = (value: string, kind: 'added' | 'removed' | 'context'): void => {
+    const plain = diffContentLines(displayText(value))
+    if (plain.length === 0) return
+    const highlighted = highlightRows(plain, language, highlight)
+    for (const [index, plainLine] of plain.entries()) {
+      const content = highlighted?.[index]
+      if (kind === 'removed') oldLine += 1
+      else if (kind === 'context') {
+        newLine += 1
+        oldLine += 1
+      } else {
+        newLine += 1
+      }
+      rows.push({
+        kind,
+        line: kind === 'removed' ? oldLine : newLine,
+        content: content ?? plainLine,
+        highlighted: content !== undefined && content !== plainLine,
+      })
+    }
+    if (kind === 'added') added += plain.length
+    else if (kind === 'removed') removed += plain.length
+  }
+
   if (diff.oldText === null) {
-    const newLines = diffContentLines(displayText(diff.newText))
-    added = newLines.length
-    for (const line of newLines) lines.push(palette.success(`+ ${line}`))
-    return { lines, added, removed, approximate: false }
-  }
-  const changes = compareLines(diff.oldText, diff.newText, { maxEditLength: maxDiffEditLength })
-  if (changes === undefined) {
-    const oldLines = diffContentLines(displayText(diff.oldText))
-    const newLines = diffContentLines(displayText(diff.newText))
-    lines.push(palette.dim(`[exact line diff omitted: >${maxDiffEditLength} changed lines]`))
-    removed = oldLines.length
-    added = newLines.length
-    for (const line of oldLines) lines.push(palette.error(`- ${line}`))
-    for (const line of newLines) lines.push(palette.success(`+ ${line}`))
-    return { lines, added, removed, approximate: true }
-  }
-  for (const change of changes) {
-    const changedLines = diffContentLines(displayText(change.value))
-    if (change.added) {
-      added += changedLines.length
-      for (const line of changedLines) lines.push(palette.success(`+ ${line}`))
-    } else if (change.removed) {
-      removed += changedLines.length
-      for (const line of changedLines) lines.push(palette.error(`- ${line}`))
+    push(diff.newText, 'added')
+  } else {
+    const changes = compareLines(diff.oldText, diff.newText, { maxEditLength: maxDiffEditLength })
+    if (changes === undefined) {
+      approximate = true
+      lines.push(palette.dim(`[exact line diff omitted: >${maxDiffEditLength} changed lines]`))
+      push(diff.oldText, 'removed')
+      push(diff.newText, 'added')
     } else {
-      for (const line of changedLines) lines.push(palette.dim(`  ${line}`))
+      for (const change of changes) {
+        push(change.value, change.added ? 'added' : change.removed ? 'removed' : 'context')
+      }
     }
   }
-  return { lines, added, removed, approximate: false }
+  return { lines: [...lines, ...renderDiffRows(foldDiffRows(rows), palette)], added, removed, approximate }
 }
 
 /**
@@ -763,12 +916,20 @@ export class ToolCardComponent extends CachedCardComponent {
       // A single-file diff whose title already names the file keeps the path
       // out of the body; multi-file diffs (or a title-less view) keep one path
       // header per file. A trailing footer summarizes the exact changed rows
-      // when the bounded comparison succeeds (`+A -R · N file(s)`).
+      // when the bounded comparison succeeds (`+A -R · N file(s)`, the counts
+      // bold). Row content syntax-highlights through the same hook the
+      // Markdown code fences use when the theme carries one.
       const first = view.diffs[0]
       const skipPath = view.diffs.length === 1 && first !== undefined
         && view.title !== undefined && view.title.includes(first.path)
       const renderedDiffs = view.diffs.map(diff =>
-        renderDiff(diff, this.maxDiffEditLength, this.palette, skipPath),
+        renderDiff(
+          diff,
+          this.maxDiffEditLength,
+          this.palette,
+          skipPath,
+          this.mdTheme.highlightCode,
+        ),
       )
       const added = renderedDiffs.reduce((total, rendered) => total + rendered.added, 0)
       const removed = renderedDiffs.reduce((total, rendered) => total + rendered.removed, 0)
@@ -777,9 +938,13 @@ export class ToolCardComponent extends CachedCardComponent {
         return [...index > 0 ? [''] : [], ...rendered.lines]
       })
       const files = new Set(view.diffs.map(diff => diff.path)).size
-      const footer = this.palette.dim(
-        `└ +${added} -${removed} · ${files} file${files === 1 ? '' : 's'}${approximate ? ' · approximate' : ''}`,
-      )
+      const footer = [
+        this.palette.dim('└ '),
+        this.palette.bold(`+${added}`),
+        this.palette.dim(' · '),
+        this.palette.bold(`-${removed}`),
+        this.palette.dim(` · ${files} file${files === 1 ? '' : 's'}${approximate ? ' · approximate' : ''}`),
+      ].join('')
       // A diff's own `+`/`-` colors carry its meaning, so it renders verbatim
       // rather than under the dim result-output color.
       const body = { prelude: [...hunks, footer], lines: [] }

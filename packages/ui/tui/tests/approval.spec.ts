@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Terminal } from '@earendil-works/pi-tui'
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
-import { createTuiTestHarness, disposeTuiTestHarness, type TuiHarness } from './harness.ts'
+import {
+  createTuiTestHarness,
+  disposeTuiTestHarness,
+  type TuiHarness,
+  type TuiHarnessOptions,
+} from './harness.ts'
 import { forkCut } from '../src/chat/fork.ts'
 
 /** Minimal terminal recorder: appends every write, replays input sends. */
@@ -40,9 +45,11 @@ async function tick(ms = 25): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function setup(): Promise<TuiHarness<FakeTerminal, (code: number) => void>> {
+async function setup(
+  options: TuiHarnessOptions = {},
+): Promise<TuiHarness<FakeTerminal, (code: number) => void>> {
   const terminal = new FakeTerminal()
-  const result = await createTuiTestHarness(terminal, vi.fn(), {})
+  const result = await createTuiTestHarness(terminal, vi.fn(), options)
   await tick()
   return result
 }
@@ -74,6 +81,8 @@ describe('approval overlay', () => {
     await tick()
     expect(result.terminal.output).toContain('needs your approval')
     expect(result.terminal.output).toContain('Allow once')
+    expect(result.terminal.output).toContain('Always allow bash this session')
+    expect(result.terminal.output).toContain('Reject')
     // Enter on the pre-selected first option.
     result.terminal.send('\r')
     await expect(outcome).resolves.toBe('allowed-once')
@@ -86,6 +95,58 @@ describe('approval overlay', () => {
     await tick()
     result.terminal.send('\x1b')
     await expect(outcome).resolves.toBe('rejected')
+    await disposeTuiTestHarness(result)
+  })
+
+  it('answers from the session allowlist without prompting again', async () => {
+    const result = await setup()
+    const first = ask(result)
+    await tick()
+    // Digit 2 = "Always allow bash this session": grant, then allow.
+    result.terminal.send('2')
+    await expect(first).resolves.toBe('allowed-once')
+    await tick()
+    // The same tool never prompts again this session…
+    const beforeSecond = result.terminal.output.length
+    const second = ask(result, { callId: 'call-2' })
+    await expect(second).resolves.toBe('allowed-once')
+    await tick()
+    // …because a second overlay never rendered.
+    expect(result.terminal.output.slice(beforeSecond)).not.toContain('needs your approval')
+    await disposeTuiTestHarness(result)
+  })
+
+  it('still prompts for a different tool after a session grant', async () => {
+    const result = await setup()
+    const first = ask(result, { toolName: 'bash' })
+    await tick()
+    result.terminal.send('2')
+    await expect(first).resolves.toBe('allowed-once')
+    await tick()
+    const beforeSecond = result.terminal.output.length
+    const second = ask(result, { toolName: 'write' })
+    await tick()
+    expect(result.terminal.output.slice(beforeSecond)).toContain('needs your approval')
+    result.terminal.send('\r')
+    await expect(second).resolves.toBe('allowed-once')
+    await disposeTuiTestHarness(result)
+  })
+
+  it('delivers a Tab footnote to the running agent as steering input', async () => {
+    const result = await setup({ status: 'running' })
+    const outcome = ask(result)
+    await tick()
+    // Tab opens the footnote line; the typed text steers the running turn.
+    result.terminal.send('\t')
+    await tick()
+    expect(result.terminal.output).toContain('tell the agent what to do differently')
+    result.terminal.send('use a sandbox')
+    result.terminal.send('\r')
+    await expect(outcome).resolves.toBe('allowed-once')
+    expect(result.agent.steeredOptions).toHaveLength(1)
+    expect(result.agent.steeredOptions[0]?.content).toEqual([
+      { type: 'text', text: '(approval feedback for bash): use a sandbox' },
+    ])
     await disposeTuiTestHarness(result)
   })
 

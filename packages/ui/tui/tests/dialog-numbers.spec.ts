@@ -78,32 +78,83 @@ describe('number-key direct selection', () => {
   })
 
   it('ApprovalDialog: options carry dim N. prefixes and digits pick them', () => {
-    const choose = vi.fn<(choice: ApprovalChoice) => void>()
+    const choose = vi.fn<(choice: ApprovalChoice, feedback?: string) => void>()
     const dialog = new ApprovalDialog(
-      'bash', undefined, 'rm -rf /tmp', 'Always — switch to danger-full-access',
+      'bash', undefined, 'rm -rf /tmp',
       plain, choose, vi.fn(),
     )
     const rendered = dialog.render(64).join('\n')
     expect(rendered).toContain('1. Allow once')
-    expect(rendered).toContain('2. Always')
+    expect(rendered).toContain('2. Always allow bash this session')
     expect(rendered).toContain('3. Reject')
     dialog.handleInput('2')
-    expect(choose).toHaveBeenCalledWith('escalate')
+    expect(choose).toHaveBeenCalledWith('allow-session')
   })
 
   it('ApprovalDialog: an out-of-range digit is ignored and Enter still works', () => {
-    const choose = vi.fn<(choice: ApprovalChoice) => void>()
-    const dialog = new ApprovalDialog('bash', undefined, undefined, undefined, plain, choose, vi.fn())
+    const choose = vi.fn<(choice: ApprovalChoice, feedback?: string) => void>()
+    const dialog = new ApprovalDialog('bash', undefined, undefined, plain, choose, vi.fn())
     dialog.render(64)
-    dialog.handleInput('3')
+    dialog.handleInput('4')
     expect(choose).not.toHaveBeenCalled()
     dialog.handleInput('\r')
     expect(choose).toHaveBeenCalledWith('allow-once')
   })
 
   it('ApprovalDialog: the numbered prefix renders dim beside the plain label', () => {
-    const dialog = new ApprovalDialog('bash', undefined, undefined, undefined, color, vi.fn(), vi.fn())
+    const dialog = new ApprovalDialog('bash', undefined, undefined, color, vi.fn(), vi.fn())
     expect(dialog.render(64).join('\n')).toContain(`${color.dim('1. ')}Allow once`)
+  })
+})
+
+describe('approval Tab footnote', () => {
+  it('Tab opens the footnote line; Enter submits it with the highlighted option', () => {
+    const choose = vi.fn<(choice: ApprovalChoice, feedback?: string) => void>()
+    const dialog = new ApprovalDialog('bash', undefined, undefined, plain, choose, vi.fn())
+    dialog.render(64)
+    dialog.handleInput('\t')
+    expect(dialog.render(64).join('\n')).toContain('tell the agent what to do differently')
+    // Digits join the draft while the footnote input is focused.
+    dialog.handleInput('1')
+    dialog.handleInput('use a sandbox')
+    dialog.handleInput('\r')
+    expect(choose).toHaveBeenCalledWith('allow-once', '1use a sandbox')
+  })
+
+  it('an empty footnote submits the highlighted option unchanged', () => {
+    const choose = vi.fn<(choice: ApprovalChoice, feedback?: string) => void>()
+    const dialog = new ApprovalDialog('bash', undefined, undefined, plain, choose, vi.fn())
+    dialog.render(64)
+    dialog.handleInput('\x1b[B') // ↓ highlights the session grant
+    dialog.handleInput('\x1b[B') // ↓ highlights Reject
+    dialog.handleInput('\t')
+    dialog.handleInput('\r')
+    expect(choose).toHaveBeenCalledWith('reject', undefined)
+  })
+
+  it('Esc returns to the options and keeps the draft for a later Tab', () => {
+    const choose = vi.fn<(choice: ApprovalChoice, feedback?: string) => void>()
+    const dialog = new ApprovalDialog('bash', undefined, undefined, plain, choose, vi.fn())
+    dialog.render(64)
+    dialog.handleInput('\t')
+    dialog.handleInput('wait')
+    dialog.handleInput('\x1b')
+    expect(choose).not.toHaveBeenCalled()
+    dialog.handleInput('\t')
+    expect(dialog.render(64).join('\n')).toContain('> wait')
+    dialog.handleInput('\r')
+    expect(choose).toHaveBeenCalledWith('allow-once', 'wait')
+  })
+
+  it('a digit in footnote mode edits the draft instead of picking an option', () => {
+    const choose = vi.fn<(choice: ApprovalChoice, feedback?: string) => void>()
+    const dialog = new ApprovalDialog('bash', undefined, undefined, plain, choose, vi.fn())
+    dialog.render(64)
+    dialog.handleInput('\t')
+    dialog.handleInput('3')
+    expect(choose).not.toHaveBeenCalled()
+    dialog.handleInput('\r')
+    expect(choose).toHaveBeenCalledWith('allow-once', '3')
   })
 })
 

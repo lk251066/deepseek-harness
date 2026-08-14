@@ -767,35 +767,40 @@ export class ConfirmDialog implements Component {
   }
 }
 
-/** The approval dialog's answer vocabulary (an escalation switches the preset, then allows). */
-export type ApprovalChoice = 'allow-once' | 'escalate' | 'reject'
+/** The approval dialog's answer vocabulary (a session grant covers one tool for the TUI's lifetime). */
+export type ApprovalChoice = 'allow-once' | 'allow-session' | 'reject'
+
+/** Placeholder shown for the approval footnote while its input is empty. */
+const APPROVAL_FEEDBACK_PLACEHOLDER = 'tell the agent what to do differently'
 
 /**
  * The tool-approval prompt: a Claude-Code-style takeover above the editor while
  * a tool call waits on the user's decision. Options carry dim `N.` prefixes and
  * digit keys 1-9 pick them directly; Enter picks the highlighted option; Esc
  * and Ctrl+C reject (the turn keeps running so the model sees the denial).
+ * Tab opens the footnote line — an optional instruction submitted alongside the
+ * highlighted option; an empty submit passes the option through unchanged, the
+ * way Claude Code's "tell Claude what to do differently" does.
  */
 export class ApprovalDialog implements Component {
   private readonly list: SelectList
   private readonly headline: readonly string[]
   /** Answer values in list order, addressed by the 1-9 digit keys. */
   private readonly choices: readonly ApprovalChoice[]
+  private readonly input = new Input()
+  private mode: 'options' | 'feedback' = 'options'
 
   constructor(
     toolName: string,
     private readonly reason: string | undefined,
     callSummary: string | undefined,
-    escalateLabel: string | undefined,
     private readonly palette: Palette,
-    private readonly choose: (choice: ApprovalChoice) => void,
+    private readonly choose: (choice: ApprovalChoice, feedback?: string) => void,
     private readonly close: () => void,
   ) {
     const entries: ReadonlyArray<{ value: ApprovalChoice; label: string; description: string }> = [
       { value: 'allow-once', label: 'Allow once', description: 'run this call' },
-      ...escalateLabel === undefined ? [] : [{
-        value: 'escalate' as const, label: escalateLabel, description: 'stop asking for this session',
-      }],
+      { value: 'allow-session', label: `Always allow ${displayText(toolName)} this session`, description: 'stop asking for this tool' },
       { value: 'reject', label: 'Reject', description: 'deny the call' },
     ]
     this.choices = entries.map(entry => entry.value)
@@ -804,7 +809,9 @@ export class ApprovalDialog implements Component {
       label: `${this.palette.dim(`${index + 1}. `)}${displayText(entry.label)}`,
       description: entry.description,
     }))
-    this.list = new SelectList(items, items.length, dialogSelectTheme(palette))
+    // The session-grant label embeds the tool name, so its primary column
+    // widens past SelectList's 32-column default to keep that name on screen.
+    this.list = new SelectList(items, items.length, dialogSelectTheme(palette), { maxPrimaryColumnWidth: 40 })
     this.list.setSelectedIndex(0)
     this.list.onSelect = (item) => {
       this.choose(item.value as ApprovalChoice)
@@ -814,6 +821,16 @@ export class ApprovalDialog implements Component {
       this.choose('reject')
       this.close()
     }
+    this.input.onSubmit = (value) => {
+      // An empty footnote submits the highlighted option unchanged.
+      const selected = this.list.getSelectedItem()
+      const choice = selected === null ? 'reject' : selected.value as ApprovalChoice
+      const feedback = value.trim()
+      this.choose(choice, feedback === '' ? undefined : feedback)
+      this.close()
+    }
+    // Esc keeps the draft: re-entering Tab shows what was typed so far.
+    this.input.onEscape = () => { this.mode = 'options' }
     this.headline = [
       this.palette.warning(`${displayText(toolName)} needs your approval`),
       ...callSummary === undefined || callSummary === '' ? [] : [this.palette.dim(displayText(callSummary))],
@@ -824,12 +841,27 @@ export class ApprovalDialog implements Component {
 
   invalidate(): void {
     this.list.invalidate()
+    this.input.invalidate()
   }
 
   handleInput(data: string): void {
     if (matchesKey(data, Key.ctrl('c'))) {
       this.choose('reject')
       this.close()
+      this.invalidate()
+      return
+    }
+    if (this.mode === 'feedback') {
+      // Digits and Tab edit the footnote here; Enter and Esc come back through
+      // the input's submit/escape callbacks.
+      this.input.focused = true
+      this.input.handleInput(data)
+      this.invalidate()
+      return
+    }
+    // Tab opens the footnote line without changing the highlighted option.
+    if (matchesKey(data, Key.tab)) {
+      this.mode = 'feedback'
       this.invalidate()
       return
     }
@@ -851,11 +883,23 @@ export class ApprovalDialog implements Component {
     const innerWidth = Math.max(1, width - 4)
     const wrapped = this.headline.flatMap(line =>
       line === '' ? [''] : new Text(line, 0, 0).render(innerWidth))
+    const body: string[] = [...wrapped, ...this.list.render(innerWidth)]
+    const hint = this.mode === 'feedback'
+      ? 'Enter submit • Esc back'
+      : '↑/↓ move • 1-3 select • Tab feedback • Enter confirm • Esc/Ctrl+C reject'
+    if (this.mode === 'feedback') {
+      this.input.focused = true
+      // The Input has no placeholder of its own, so an empty draft renders the
+      // dim instruction line in its place.
+      const draft = this.input.getValue() === ''
+        ? this.palette.dim(`> ${APPROVAL_FEEDBACK_PLACEHOLDER}`)
+        : this.input.render(innerWidth).join('')
+      body.push('', truncateToWidth(draft, innerWidth, ''))
+    }
     return renderDialog('Approval', [
-      ...wrapped,
-      ...this.list.render(innerWidth),
+      ...body,
       '',
-      this.palette.dim('↑/↓ move • 1-9 select • Enter confirm • Esc/Ctrl+C reject'),
+      this.palette.dim(hint),
     ], width, this.palette)
   }
 }

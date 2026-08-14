@@ -66,7 +66,96 @@ function projectionValue<T>(deps: InsightsDeps, key: string): T | undefined {
   }
 }
 
-/** The `/context` body rows: occupancy header, segmented bar, per-source rows. */
+/** Cell width of the `/context` segmented composition bar. */
+const SEGMENT_BAR_WIDTH = 20
+
+/** Cell counts for the four segments of the `/context` composition bar. */
+export interface SegmentCells {
+  readonly system: number
+  readonly tools: number
+  readonly messages: number
+  readonly free: number
+}
+
+/**
+ * Split `cells` across `weights` by the largest-remainder method: every weight
+ * takes its floored quota, and the cells lost to flooring go to the largest
+ * fractional remainders (ties broken by original order), so the allocation
+ * always sums to exactly `cells` — no cell is silently dropped to rounding.
+ *
+ * @param weights - Non-negative weights; a zero weight never earns a cell
+ * unless every weight is zero (then so is `cells` for the caller's clamps).
+ * @param cells - Cells to distribute; `<= 0` returns all zeros.
+ * @returns One allocated count per weight, summing to `cells`.
+ */
+function largestRemainderCells(weights: readonly number[], cells: number): number[] {
+  const safe = weights.map(weight => Math.max(0, weight))
+  const total = safe.reduce((sum, weight) => sum + weight, 0)
+  if (cells <= 0 || total <= 0) return safe.map(() => 0)
+  const exact = safe.map(weight => weight / total * cells)
+  const allocated = exact.map(value => Math.floor(value))
+  let leftover = cells - allocated.reduce((sum, value) => sum + value, 0)
+  const order = exact
+    .map((value, index) => ({ index, remainder: value - Math.floor(value) }))
+    .sort((a, b) => b.remainder - a.remainder || a.index - b.index)
+  for (const { index } of order) {
+    if (leftover <= 0) break
+    allocated[index] = (allocated[index] ?? 0) + 1
+    leftover -= 1
+  }
+  return allocated
+}
+
+/**
+ * Allocate the `/context` composition bar's cells, Claude Code's single
+ * multi-color bar: the window is the whole bar, the used part covers
+ * `round(system + tools + messages / window · width)` cells split across the
+ * three categories by largest remainder, and the unused remainder is free
+ * space. A composition exceeding the window clamps to a full bar with no free
+ * cells.
+ *
+ * @param parts - The three category token counts from `contextBreakdown`.
+ * @param windowTokens - The context window; `<= 0` yields an all-free bar.
+ * @param width - Total bar width in cells; defaults to {@link SEGMENT_BAR_WIDTH}.
+ * @returns The per-segment cell counts; the four always sum to `width`.
+ */
+export function contextSegmentCells(
+  parts: { system: number; tools: number; messages: number },
+  windowTokens: number,
+  width = SEGMENT_BAR_WIDTH,
+): SegmentCells {
+  const used = windowTokens <= 0
+    ? 0
+    : Math.min(width, Math.max(0, Math.round((parts.system + parts.tools + parts.messages) / windowTokens * width)))
+  const [system, tools, messages] = largestRemainderCells(
+    [parts.system, parts.tools, parts.messages],
+    used,
+  )
+  return {
+    system: system ?? 0,
+    tools: tools ?? 0,
+    messages: messages ?? 0,
+    free: width - used,
+  }
+}
+
+/**
+ * Render the composition bar: one unbroken run of `█` per category in its
+ * palette color (system accent, tools warning, messages success) with no
+ * separators between segments, then the free remainder as recessed `·` cells.
+ * Empty segments emit nothing — an empty-colored span is an escape pair around
+ * nothing, which downstream consumers treat as a leak.
+ */
+function segmentBar(cells: SegmentCells, palette: Palette): string {
+  const segments: string[] = []
+  if (cells.system > 0) segments.push(palette.accent('█'.repeat(cells.system)))
+  if (cells.tools > 0) segments.push(palette.warning('█'.repeat(cells.tools)))
+  if (cells.messages > 0) segments.push(palette.success('█'.repeat(cells.messages)))
+  if (cells.free > 0) segments.push(palette.dim('·'.repeat(cells.free)))
+  return segments.join('')
+}
+
+/** The `/context` body rows: occupancy header, pressure meters, composition bar and legend. */
 export function contextLines(deps: InsightsDeps, palette: Palette): string[] {
   const pressure = projectionValue<{ projectedTokens?: number; pressureTokens?: number; contextWindow?: number }>(deps, 'contextPressure')
   const breakdown = projectionValue<{ systemTokens?: number; toolsTokens?: number; messageTokens?: number }>(deps, 'contextBreakdown')
@@ -86,10 +175,17 @@ export function contextLines(deps: InsightsDeps, palette: Palette): string[] {
     const tools = breakdown.toolsTokens ?? 0
     const messages = breakdown.messageTokens ?? 0
     const total = Math.max(1, system + tools + messages)
-    const bar = (tokens: number): string => '█'.repeat(Math.max(1, Math.round(tokens / total * 10)))
-    rows.push('', `system   ${palette.dim(bar(system))} ${formatDiagnosticNumber(system)}`)
-    rows.push(`tools    ${palette.dim(bar(tools))} ${formatDiagnosticNumber(tools)}`)
-    rows.push(`messages ${palette.dim(bar(messages))} ${formatDiagnosticNumber(messages)}`)
+    rows.push('', segmentBar(contextSegmentCells({ system, tools, messages }, window), palette))
+    // Legend swatches reuse each segment's color; category percentages stay
+    // relative to the composition total (the heuristic sum), while the free
+    // row reports the window's unclaimed remainder.
+    const legend = (tokens: number): string =>
+      `${formatDiagnosticNumber(tokens)} (${Math.round(tokens / total * 100)}%)`
+    rows.push(`${palette.accent('██')} system  ${legend(system)}`)
+    rows.push(`${palette.warning('██')} tools   ${legend(tools)}`)
+    rows.push(`${palette.success('██')} messages ${legend(messages)}`)
+    const free = Math.max(0, window - (system + tools + messages))
+    rows.push(palette.dim(`·· free    ${formatDiagnosticNumber(free)} (${Math.round(free / window * 100)}%)`))
     rows.push('', palette.dim('Heuristic composition — proportions are approximate.'))
   }
   return rows

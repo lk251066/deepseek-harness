@@ -75,7 +75,7 @@ describe('strong-interruption dialogs keep the rounded frame', () => {
   })
 
   it('ApprovalDialog renders the round border', () => {
-    const dialog = new ApprovalDialog('bash', undefined, 'rm -rf /tmp', undefined, plain, vi.fn(), vi.fn())
+    const dialog = new ApprovalDialog('bash', undefined, 'rm -rf /tmp', plain, vi.fn(), vi.fn())
     const joined = dialog.render(64).join('\n')
     expect(joined).toContain('╭ Approval')
     expect(joined).toContain('╰')

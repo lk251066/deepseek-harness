@@ -556,6 +556,42 @@ export interface ThemeChoice {
 }
 
 /**
+ * A read-only framed dialog over pre-rendered lines: Esc/Ctrl+C/q closes,
+ * `r` recomputes the body through {@link refresh} when supplied. Backs
+ * `/context`, `/agents`, `/jobs`, and `/settings`.
+ */
+export class StaticDialog implements Component {
+  private lines: readonly string[]
+
+  constructor(
+    private readonly title: string,
+    lines: readonly string[],
+    private readonly palette: Palette,
+    private readonly close: () => void,
+    private readonly refresh?: () => readonly string[],
+  ) {
+    this.lines = lines
+  }
+
+  invalidate(): void {}
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl('c'))) {
+      this.close()
+    } else if (matchesKey(data, 'r') && this.refresh !== undefined) {
+      this.lines = this.refresh()
+    }
+  }
+
+  render(width: number): string[] {
+    const innerWidth = Math.max(1, width - 4)
+    const body = [...this.lines, '', this.palette.dim(this.refresh === undefined ? 'Esc close' : 'r refresh • Esc close')]
+    return renderDialog(this.title, body.flatMap(line =>
+      line === '' ? [''] : truncateToWidth(line, innerWidth, '')), Math.min(width, 76), this.palette)
+  }
+}
+
+/**
  * The `/rename` sheet: a single-line title editor. Enter renames (empty input
  * rejects with the sheet's own error line), Esc/Ctrl+C closes unchanged.
  */

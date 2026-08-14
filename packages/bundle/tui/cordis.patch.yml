@@ -53,6 +53,11 @@
         writeEveryEvents: 200
         writeIntervalMs: 5000
 
+    # Whole-log turn/step counts and wall-time totals for the TUI stats strip
+    # (the `sessionStats` projection key), matching the web surface's rows.
+    - id: session-stats
+      name: '@deepseek-ai/dsh-session-stats'
+
     # Shared storage (same root the web surface uses).
     - id: storage
       name: '@deepseek-ai/dsh-storage'

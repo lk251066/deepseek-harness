@@ -7,6 +7,7 @@
 
 import {
   Container,
+  Image,
   Markdown,
   Spacer,
   Text,
@@ -179,18 +180,71 @@ export class HeaderComponent implements Component {
 }
 
 /**
+ * One image content block, rendered through pi-tui's `Image` once the
+ * attachment bytes land (kitty/iTerm2 protocols; other terminals get the
+ * component's own fallback line). Until then a placeholder line shows.
+ */
+export class ImageBlockComponent extends Container {
+  constructor(
+    attachmentId: string,
+    mediaType: string,
+    load: (attachmentId: string) => Promise<Uint8Array | undefined>,
+    palette: Palette,
+  ) {
+    super()
+    this.addChild(new Text(palette.dim(`[loading image ${displayText(attachmentId)}]`), 0, 0))
+    void load(attachmentId).then(data => {
+      this.clear()
+      if (data === undefined) {
+        this.addChild(new Text(palette.dim(`[image ${displayText(attachmentId)} unavailable]`), 0, 0))
+      } else {
+        this.addChild(new Image(
+          Buffer.from(data).toString('base64'),
+          mediaType,
+          { fallbackColor: text => palette.dim(text) },
+          { maxWidthCells: 40, filename: attachmentId },
+        ))
+      }
+      this.invalidate()
+    })
+  }
+
+  override invalidate(): void {
+    for (const child of this.children) child.invalidate()
+  }
+}
+
+/**
  * A user or steering prompt in the transcript. An underlined accent role header
  * plus blank-line spacing separate it from surrounding blocks; body lines carry
  * no prefix or indent, so a terminal drag-select copies the prompt verbatim.
+ * Image blocks render inline beneath the text through {@link ImageBlockComponent}.
  */
 export class UserMessageComponent extends Container {
-  constructor(text: string, palette: Palette, mdTheme: MarkdownTheme, label = 'You') {
+  constructor(
+    text: string,
+    palette: Palette,
+    mdTheme: MarkdownTheme,
+    label = 'You',
+    images: readonly { attachmentId: string, mediaType: string }[] = [],
+    loadImage?: (attachmentId: string) => Promise<Uint8Array | undefined>,
+  ) {
     super()
     this.addChild(new Text(messageHeader(label, palette.accent, palette), 0, 0))
     this.addChild(new Markdown(displayText(text), 0, 0, mdTheme, { color: value => palette.text(value) }, {
       preserveOrderedListMarkers: true,
       preserveBackslashEscapes: true,
     }))
+    const loader: (attachmentId: string) => Promise<Uint8Array | undefined>
+      = loadImage === undefined ? () => Promise.resolve(undefined) : loadImage
+    for (const image of images) {
+      this.addChild(new ImageBlockComponent(
+        image.attachmentId,
+        image.mediaType,
+        loader,
+        palette,
+      ))
+    }
   }
 }
 

@@ -155,6 +155,16 @@ import { createPermissionController } from './chat/permission.ts'
 import { createQuestionQueue } from './chat/questions.ts'
 import { createQueueDock, replaceQueuedMessage } from './chat/queue-dock.ts'
 import { forkSession } from './chat/fork.ts'
+import {
+  agentsLines,
+  contextLines,
+  jobsLines,
+  openStaticDialog,
+  settingsLines,
+  statsStrip,
+  writeExport,
+  type InsightsDeps,
+} from './chat/insights.ts'
 import { foldPlanMode } from '@deepseek-ai/dsh-plan-mode'
 import { createResumeController } from './chat/resume.ts'
 import type { TuiResumeHost, TuiRuntime } from './runtime.ts'
@@ -462,12 +472,13 @@ export function createTuiChat(
     ctx.tuiPrompt.register('indicator', palette.dim('> ')),
     ctx.tuiPrompt.register('permission'),
     ctx.tuiPrompt.register('plan'),
+    ctx.tuiPrompt.register('stats'),
   ]
-  const [cwdValue, gitValue, tokenValue, modelValue, contextValue, queuedValue, symbolValue, indicatorValue, permissionValue, planValue] = promptValues
+  const [cwdValue, gitValue, tokenValue, modelValue, contextValue, queuedValue, symbolValue, indicatorValue, permissionValue, planValue, statsValue] = promptValues
   /* v8 ignore next -- the fixed built-in registration list always supplies each handle. */
   if (cwdValue === undefined || gitValue === undefined || tokenValue === undefined || modelValue === undefined
     || contextValue === undefined || queuedValue === undefined || symbolValue === undefined || indicatorValue === undefined
-    || permissionValue === undefined || planValue === undefined) {
+    || permissionValue === undefined || planValue === undefined || statsValue === undefined) {
     throw new Error('TUI prompt built-ins failed to initialize')
   }
   /**
@@ -519,6 +530,8 @@ export function createTuiChat(
     planValue.set(foldPlanMode(agent.session.events)
       ? palette.bold(palette.accent(' ⎇ plan'))
       : undefined)
+    const stats = statsStrip(insights)
+    statsValue.set(stats === undefined ? undefined : palette.dim(`  ${stats}`))
     symbolValue.set(palette.bold(palette.accent('dsh')))
     compactionStatusLine.setText(compacting === undefined
       ? ''
@@ -702,6 +715,21 @@ export function createTuiChat(
   })
   docks.addChild(goalBar.component)
   docks.addChild(queueDock.component)
+
+  // Insight surfaces (/context, /agents, /jobs, /settings, /export, stats strip).
+  const insights: InsightsDeps = { ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent }
+
+  /** Resolve one stored image attachment's bytes through the optional store. */
+  const loadAttachmentImage = (attachmentId: string): Promise<Uint8Array | undefined> => {
+    const attachments = ctx.get('attachments') as {
+      readImage?: (ref: { attachmentId: string, mediaType: string }, signal?: AbortSignal) => Promise<{ data: Uint8Array }>
+    } | undefined
+    if (attachments?.readImage === undefined) return Promise.resolve(undefined)
+    return attachments.readImage({ attachmentId, mediaType: 'image/png' }).then(
+      stored => stored.data,
+      () => undefined,
+    )
+  }
 
   updatePromptValues()
 
@@ -946,10 +974,13 @@ export function createTuiChat(
           break
         }
         const text = displayText(contentText(event.data.content).trim())
-        if (text) {
+        const images = event.data.content
+          .filter((block): block is Extract<ContentBlock, { type: 'image' }> => block.type === 'image')
+          .map(block => ({ attachmentId: String(block.attachment.attachmentId), mediaType: block.attachment.mediaType }))
+        if (text || images.length > 0) {
           chat.addChild(new Spacer(1))
-          chat.addChild(new UserMessageComponent(text, palette, mdTheme))
-          if (options.addHistory) editor.addToHistory(text)
+          chat.addChild(new UserMessageComponent(text, palette, mdTheme, 'You', images, loadAttachmentImage))
+          if (options.addHistory && text) editor.addToHistory(text)
         }
         break
       }
@@ -1654,6 +1685,57 @@ export function createTuiChat(
       name: 'status',
       description: 'Show session diagnostics, system prompt, and registered tools',
       handler: async ({ signal }) => { await showStatus(signal); return { kind: 'success' } },
+    })
+    commandCtx.commands.register({
+      name: 'context',
+      description: 'Show context occupancy and its system/tools/messages breakdown',
+      handler: () => {
+        openStaticDialog(insights, 'Context', contextLines(insights, palette), () => contextLines(insights, palette))
+        return { kind: 'success' }
+      },
+    })
+    commandCtx.commands.register({
+      name: 'agents',
+      description: 'List this session\'s subagent sessions and their activity',
+      handler: async ({ signal }) => {
+        const lines = await agentsLines(insights, signal)
+        if (!isDisposed()) openStaticDialog(insights, 'Subagents', lines)
+        return { kind: 'success' }
+      },
+    })
+    commandCtx.commands.register({
+      name: 'jobs',
+      description: 'List this session\'s background jobs',
+      handler: () => {
+        openStaticDialog(insights, 'Background jobs', jobsLines(insights), () => jobsLines(insights))
+        return { kind: 'success' }
+      },
+    })
+    commandCtx.commands.register({
+      name: 'settings',
+      description: 'Show settings namespaces and where overrides live',
+      handler: () => {
+        openStaticDialog(insights, 'Settings', settingsLines(insights), () => settingsLines(insights))
+        return { kind: 'success' }
+      },
+    })
+    commandCtx.commands.register({
+      name: 'export',
+      description: 'Write this session\'s transcript to a markdown file',
+      input: { hint: '[path]' },
+      handler: ({ rawInput }) => {
+        const argument = rawInput.trim()
+        if (argument !== '') {
+          appendNotice('Writing to a chosen path is not supported yet; the export lands in the workspace root.', 'warning')
+        }
+        try {
+          const path = writeExport(cwd, agent.session)
+          appendNotice(`Exported to ${path}`)
+        } catch (error) {
+          appendNotice(`Export failed: ${errorChain(error)}`, 'error')
+        }
+        return { kind: 'success' }
+      },
     })
     const exitHandler = (): CommandResult => {
       requestExit()

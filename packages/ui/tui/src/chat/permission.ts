@@ -17,11 +17,24 @@ export interface PermissionPresetsService {
   set(session: unknown, name: string): unknown
 }
 
+/**
+ * The danger-preset acknowledgement text, in the Claude-Code bypass-permissions
+ * shape: an all-caps WARNING title line (rendered in the error color) over a
+ * body that says what is lost and where the preset belongs.
+ */
+const DANGER_FULL_ACCESS_WARNING = [
+  'WARNING: danger-full-access disables all permission checks',
+  'The agent can run any command and edit any file without asking. Recommended only inside a sandbox or container.',
+].join('\n')
+
 /** Collaborators the permission ring needs from the chat channel. */
 export interface PermissionDeps extends ChatChannelDeps, ChannelNotice {
   /** The agent whose session's preset cycles. */
   agent: Agent
-  /** Open the danger-preset confirmation overlay. */
+  /**
+   * Open the danger-preset confirmation overlay. A `\n`-separated message
+   * renders its first line as an error-colored warning title.
+   */
   confirmRisk(message: string, onChoice: (confirmed: boolean) => void): void
 }
 
@@ -71,7 +84,7 @@ export function createPermissionController(deps: PermissionDeps): PermissionCont
       const spec = service.resolve(next)
       if (spec.sandbox === 'danger-full-access') {
         deps.confirmRisk(
-          'danger-full-access disables the sandbox AND approval prompts — the agent can run any command and edit any file.',
+          DANGER_FULL_ACCESS_WARNING,
           (confirmed) => { if (confirmed) apply(next) },
         )
         return

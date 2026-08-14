@@ -60,9 +60,13 @@ describe('Shift+Tab permission ring', () => {
     expect(terminal.output).toContain('[workspace-write]')
 
     // Shift+Tab from workspace-write targets the danger preset: confirm first.
+    // The acknowledgement is the Claude-Code-style warning: an error-toned
+    // WARNING title over a body recommending a sandbox or container.
     terminal.send('\x1b[Z')
     await new Promise(resolve => setTimeout(resolve, 25))
     expect(terminal.output).toContain('Full access')
+    expect(terminal.output).toContain('WARNING: danger-full-access disables all permission checks')
+    expect(terminal.output).toContain('sandbox or container')
     expect(applied).toEqual([])
 
     // Escape the confirmation: nothing applied.
@@ -70,9 +74,17 @@ describe('Shift+Tab permission ring', () => {
     await new Promise(resolve => setTimeout(resolve, 25))
     expect(applied).toEqual([])
 
-    // Cycle again and confirm: the preset switch lands.
+    // The confirmation opens on the safe No item: Enter alone keeps the preset.
     terminal.send('\x1b[Z')
     await new Promise(resolve => setTimeout(resolve, 25))
+    terminal.send('\r')
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(applied).toEqual([])
+
+    // Cycle again and deliberately move to the Yes item: the preset switch lands.
+    terminal.send('\x1b[Z')
+    await new Promise(resolve => setTimeout(resolve, 25))
+    terminal.send('\x1b[B')
     terminal.send('\r')
     await new Promise(resolve => setTimeout(resolve, 25))
     expect(applied).toEqual(['danger-full-access'])

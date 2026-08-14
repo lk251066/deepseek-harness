@@ -37,6 +37,13 @@ import {
   singleWordLogoRows,
 } from './logo.ts'
 import { contentText, type ParsedArguments } from './content.ts'
+import {
+  RESULT_CONTINUATION,
+  RESULT_MARKER,
+  shortcutHint,
+  THINKING_GLYPH,
+  TOOL_SETTLED,
+} from './figures.ts'
 import { progressiveTitle, settledTitle } from '../chat/tool-verbs.ts'
 import {
   formatStatusDuration,
@@ -304,10 +311,12 @@ function assistantMessageChildren(
   const children: Component[] = [new Spacer(1)]
   if (foldsReasoning) {
     const duration = thinkingMs === undefined ? '' : ` · ${formatStatusDuration(thinkingMs)}`
-    children.push(new Text(palette.italic(palette.dim(`∴ Thinking${duration} (ctrl+r to expand)`)), 0, 0))
+    children.push(new Text(palette.italic(palette.dim(
+      `${THINKING_GLYPH} Thinking${duration} ${shortcutHint('ctrl+r', 'expand')}`,
+    )), 0, 0))
   } else if (showsReasoning) {
     children.push(
-      new Text(palette.italic(palette.dim('∴ Thinking…')), 0, 0),
+      new Text(palette.italic(palette.dim(`${THINKING_GLYPH} Thinking…`)), 0, 0),
       new Markdown(reasoning, 0, 0, mdTheme, { color: value => palette.dim(value), italic: true }),
     )
   }
@@ -466,11 +475,6 @@ interface CardBody {
  */
 export type ToolCardVisibility = 'hidden' | 'collapsed' | 'expanded'
 
-/** Marker column prefixing a card's first result row (the Claude Code `⎿`). */
-const RESULT_MARKER = '  ⎿ '
-/** Indent aligning continuation rows under the marker's text column. */
-const RESULT_CONTINUATION = '    '
-
 /**
  * Prefix a card's body rows with the result marker: the first non-blank row
  * carries `⎿`, later rows align under its text column, blank rows stay empty.
@@ -626,10 +630,11 @@ export class ToolCardComponent extends CachedCardComponent {
     if (this.visibility === 'hidden') return []
     const isError = this.result?.isError ?? false
     // Claude-Code-style marker: the braille spinner frame while pending (the
-    // hollow dot before the first tick or in a replayed log), the filled ⏺
-    // once settled; the header color (warning/success/error) doubles the state.
+    // hollow dot before the first tick or in a replayed log), the filled
+    // platform-appropriate settled dot (`⏺` on macOS, `●` elsewhere) once
+    // settled; the header color (warning/success/error) doubles the state.
     const pending = this.result === undefined
-    const glyph = pending ? this.spinnerFrame ?? '○' : '⏺'
+    const glyph = pending ? this.spinnerFrame ?? '○' : TOOL_SETTLED()
     const rawBody = this.renderBody()
     const view = this.resultView ?? this.callView
     // A generic card's own content, a read card's `content` fallback (the
@@ -661,7 +666,7 @@ export class ToolCardComponent extends CachedCardComponent {
         text => this.palette.dim(text),
         text => this.palette.dim(text),
         /* v8 ignore next -- renderUnknownXml calls the collapsed summary only when hidden XML children exceed this card's limit. */
-        count => this.palette.dim(`  … +${count} lines (Ctrl+O to expand)`),
+        count => this.palette.dim(`  … +${count} lines ${shortcutHint('ctrl+o', 'expand')}`),
       )
       : undefined
     // A generic card renders title and result as one Markdown document, so the
@@ -672,7 +677,7 @@ export class ToolCardComponent extends CachedCardComponent {
       : [...rawBody.prelude, ...rawBody.lines])
     const visibleBody = unknownXml !== undefined || this.visibility === 'expanded'
       ? body
-      : preview(body, this.maxOutputLines, count => this.palette.dim(`… +${count} lines (Ctrl+O to expand)`))
+      : preview(body, this.maxOutputLines, count => this.palette.dim(`… +${count} lines ${shortcutHint('ctrl+o', 'expand')}`))
     // The header is one card row in the status color (warning pending /
     // success ok / error): the marker glyph, a verb title naming what THIS call
     // does (progressive while pending, the presenter's settled label once
@@ -909,7 +914,7 @@ export class ContextCardComponent extends CachedCardComponent {
       .map(line => line === '' ? line : this.palette.dim(displayText(line)))
     const visibleBody = this.expanded
       ? body
-      : preview(body, this.maxOutputLines, count => this.palette.dim(`… +${count} lines (Ctrl+O to expand)`))
+      : preview(body, this.maxOutputLines, count => this.palette.dim(`… +${count} lines ${shortcutHint('ctrl+o', 'expand')}`))
     return [header, ...new Text(visibleBody.join('\n'), 0, 0).render(width)]
   }
 }

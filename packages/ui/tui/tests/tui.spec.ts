@@ -44,6 +44,7 @@ import {
 import { WorkspaceFileSearch } from '../src/chat/file-autocomplete.ts'
 import { ResumePicker } from '../src/components/dialogs.ts'
 import { ATTRIBUTE_ROLES, brandText, COLOR_ROLES, createPalette, paletteSpec } from '../src/components/theme.ts'
+import { TOOL_SETTLED } from '../src/components/figures.ts'
 import {
   appendAssistant,
   appendUser,
@@ -1831,7 +1832,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     // collapsed by default with the shared Ctrl+O expand marker.
     expect(result.terminal.output).toContain('Context · workspace-context')
     expect(result.terminal.output).not.toContain('system-reminder')
-    expect(result.terminal.output).toContain('lines (Ctrl+O to expand)')
+    expect(result.terminal.output).toContain('lines (ctrl+o to expand)')
     expect(result.terminal.output).toContain('instruction line 0')
     expect(result.terminal.output).not.toContain('instruction line 5')
 
@@ -1902,7 +1903,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
 
     expect(result.terminal.output).toContain('Context · prose-context')
     expect(result.terminal.output).not.toContain('<system-reminder>')
-    expect(result.terminal.output).toContain('lines (Ctrl+O to expand)')
+    expect(result.terminal.output).toContain('lines (ctrl+o to expand)')
     expect(result.terminal.output).not.toContain('prose line 5')
 
     result.terminal.send('\x0f')
@@ -2978,6 +2979,11 @@ describe('pi-tui chat lifecycle and transcript', () => {
     }
     result.terminal.send('draft')
     result.terminal.send('\x03')
+    // Ctrl+C cleared the draft; Ctrl+D now needs a second press inside the
+    // 800 ms window, and the first press shows the arm hint.
+    result.terminal.send('\x04')
+    await tick()
+    expect(result.terminal.output).toContain('press ctrl+d again to exit')
     result.terminal.send('\x04')
     await tick()
 
@@ -3004,6 +3010,12 @@ describe('pi-tui chat lifecycle and transcript', () => {
     await result.ctx.fiber.dispose()
 
     const ctrlCExit = await setup()
+    // Idle empty prompt: the first Ctrl+C arms (no exit), the second inside
+    // the 800 ms window exits.
+    ctrlCExit.terminal.send('\x03')
+    await tick()
+    expect(ctrlCExit.terminal.output).toContain('press ctrl+c again to exit')
+    expect(ctrlCExit.exit).not.toHaveBeenCalled()
     ctrlCExit.terminal.send('\x03')
     await tick()
     expect(ctrlCExit.exit).toHaveBeenCalledWith(0)
@@ -5095,11 +5107,12 @@ describe('tool cards and surface replay', () => {
     // to `\x0a`), so they cannot break onto extra rows and collide with the body.
     expect(output).toContain('S=/tmp\\x0aecho "$S"')
     expect(output).toContain('set\\x0aand echo')
-    expect(output).toContain('lines (Ctrl+O to expand)')
+    expect(output).toContain('lines (ctrl+o to expand)')
     expect(output).toContain('SIGTERM')
-    // The header is the presenter's settled verb title behind the ⏺ marker.
-    expect(output).toContain('⏺ Run command')
-    expect(output).toContain('⏺ Edit files')
+    // The header is the presenter's settled verb title behind the settled
+    // marker (the platform branch: ⏺ on macOS, ● elsewhere).
+    expect(output).toContain(`${TOOL_SETTLED()} Run command`)
+    expect(output).toContain(`${TOOL_SETTLED()} Edit files`)
     // An empty-string terminal description leaves the progressive
     // Running(command) label; the command shows as the body $-line.
     expect(output).toContain('○ Running blank desc command')
@@ -5110,7 +5123,7 @@ describe('tool cards and surface replay', () => {
     // the raw model-facing result text through the same dim generic body — the
     // TUI has no dedicated search arm. The settled label falls back to the call
     // title (the search result view replaces none).
-    expect(output).toContain('⏺ Grep todo')
+    expect(output).toContain(`${TOOL_SETTLED()} Grep todo`)
     expect(output).toContain('Line 1: todo one')
     // A multi-file diff's title carries no path, so each file keeps its own
     // path header in the body. The second file's change and the footer sit
@@ -5177,7 +5190,7 @@ describe('tool cards and surface replay', () => {
     result.terminal.send('\x0c')
     await tick()
     const hiddenFrame = result.terminal.output.slice(result.terminal.output.lastIndexOf('\x1b[2J'))
-    expect(hiddenFrame).not.toContain('⏺')
+    expect(hiddenFrame).not.toContain(TOOL_SETTLED())
     expect(hiddenFrame).not.toContain('Run command')
     expect(hiddenFrame).not.toContain('fallback result body')
     // The dozen hidden cards leave no per-card blank rows behind: each card owns

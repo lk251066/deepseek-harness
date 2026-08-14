@@ -113,6 +113,8 @@ import {
 import { FramedEditorComponent } from './components/framed-editor.ts'
 import { WorkingLineComponent } from './components/working-line.ts'
 import { logoFullWidth, logoSingleWordWidth, SHIMMER_INTERVAL_MS, SHIMMER_WIDTH } from './components/logo.ts'
+import { pickSpinnerVerb } from './chat/spinner-verbs.ts'
+import { contextPressureLevel } from './chat/context-pressure.ts'
 import {
   compactTargetLabel,
   ConfirmDialog,
@@ -518,9 +520,21 @@ export function createTuiChat(
     const occupancy = effectiveWindow === undefined || effectiveWindow <= 0
       ? undefined
       : Math.min(100, usedTokens / effectiveWindow * 100)
-    contextValue.set(occupancy === undefined ? undefined : `  ${palette.dim(
-      `${contextMeter(occupancy, palette)} ${Math.round(occupancy)}% context`,
-    )}`)
+    if (occupancy === undefined) {
+      contextValue.set(undefined)
+    } else {
+      // The meter segments and the percent number share the pressure color
+      // (dim → warning → error); the surrounding text stays dim. Colored
+      // pieces are concatenated rather than nested (single-Colored rule).
+      const level = contextPressureLevel(occupancy)
+      const percentText = `${Math.round(occupancy)}%`
+      const percent = level === 'critical'
+        ? palette.error(percentText)
+        : level === 'warning'
+          ? palette.warning(percentText)
+          : palette.dim(percentText)
+      contextValue.set(`  ${contextMeter(occupancy, palette)} ${percent}${palette.dim(' context')}`)
+    }
     const queued = runningStatus === undefined ? undefined : formatQueuedStatus(pendingSteering.size)
     queuedValue.set(queued === undefined ? undefined : palette.dim(queued))
     // Shift+Tab's preset ring and the plan-mode chip; absent services render nothing.
@@ -532,9 +546,11 @@ export function createTuiChat(
     const stats = statsStrip(insights)
     statsValue.set(stats === undefined ? undefined : palette.dim(`  ${stats}`))
     symbolValue.set(palette.bold(palette.accent('dsh')))
-    compactionStatusLine.setText(compacting === undefined
-      ? ''
-      : palette.dim(`Context being compacted ${formatStatusDuration(renderTime - compacting.startedAt)}`))
+    compactionStatusLine.setText(compacting !== undefined
+      ? palette.dim(`Context being compacted ${formatStatusDuration(renderTime - compacting.startedAt)}`)
+      : occupancy !== undefined && contextPressureLevel(occupancy) === 'critical'
+        ? palette.error(`Context low · ${Math.round(occupancy)}% used · run /compact to free space`)
+        : '')
     // `${indicator}` owns the caret column and its trailing gap before the
     // cursor. The active status glyph replaces the `>` caret in place — same
     // width every frame — fading in when work starts, throbbing while it runs,
@@ -845,6 +861,13 @@ export function createTuiChat(
   // when idle, so the tick is effectively self-gating.
   let spinnerFrame = 0
   let workShown = false
+  // Working-line extras: one random fun verb per turn (seeded off the turn
+  // number so the word stays stable within a turn), streamed-token estimate
+  // (chars/4) for the status segment, and the last stream output time for
+  // the stall warning.
+  const verbBase = Date.now() % 997
+  let streamedChars = 0
+  let lastOutputAt: number | undefined
   const spinnerTimer = setInterval(() => {
     if (disposed) return
     const frame = TOOL_SPINNER_FRAMES[spinnerFrame++ % TOOL_SPINNER_FRAMES.length] ?? TOOL_SPINNER_FRAMES[0]
@@ -870,6 +893,11 @@ export function createTuiChat(
       runningStatus?.startedAt ?? compacting?.startedAt,
       pending?.label(),
       frame,
+      {
+        verb: pickSpinnerVerb(verbBase + (runningStatus?.turn ?? 0)),
+        emittedTokens: Math.floor(streamedChars / 4),
+        ...lastOutputAt === undefined ? {} : { lastOutputAt },
+      },
     )
     requestRender()
   }, TOOL_SPINNER_INTERVAL_MS)
@@ -996,6 +1024,14 @@ export function createTuiChat(
         startAssistantStep(event.data, event.time)
         break
       case 'assistant/chunk':
+        // Working-line extras: every streamed character feeds the token
+        // estimate and refreshes the stall clock, regardless of whether this
+        // pass renders the chunk.
+        {
+          const chunk = event.data.chunk
+          if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') streamedChars += chunk.text.length
+          lastOutputAt = event.time
+        }
         if (options.renderChunks && streaming !== undefined) {
           streaming.update(event.data.chunk)
           // The first streamed text/reasoning may make this step the turn's
@@ -1057,6 +1093,8 @@ export function createTuiChat(
       case 'turn/start':
         // Plan strip is turn-scoped: keep it after turn/end for reading, clear on the next turn.
         todo.update([])
+        streamedChars = 0
+        lastOutputAt = undefined
         break
       case 'session/title':
         sessionTitle = event.data.title
@@ -1202,7 +1240,49 @@ export function createTuiChat(
     agentStatus,
   })
 
+  // Ctrl+C/Ctrl+D at an idle empty prompt require a second press within
+  // EXIT_DOUBLE_PRESS_MS (the Claude Code convention) — a stray press shows a
+  // dim hint on the editor instead of killing the session.
+  const EXIT_DOUBLE_PRESS_MS = 800
+  // Hard ceiling on the shutdown dispose chain before the exit fires anyway.
+  const SHUTDOWN_EXIT_FALLBACK_MS = 3_000
+  let exitArmedAt: number | undefined
+  const doublePressExit = (key: string): void => {
+    const pressedAt = now()
+    if (exitArmedAt !== undefined && pressedAt - exitArmedAt <= EXIT_DOUBLE_PRESS_MS) {
+      exitArmedAt = undefined
+      editor.hint = undefined
+      requestExit()
+      return
+    }
+    exitArmedAt = pressedAt
+    editor.hint = palette.dim(`press ${key} again to exit`)
+    requestRender()
+    setTimeout(() => {
+      // Disarm quietly once the window lapses; setStatus restores the
+      // state-appropriate hint (idle has none).
+      if (exitArmedAt !== undefined && now() - exitArmedAt >= EXIT_DOUBLE_PRESS_MS) {
+        exitArmedAt = undefined
+        editor.hint = undefined
+        requestRender()
+      }
+    }, EXIT_DOUBLE_PRESS_MS + 50)
+  }
+
   const shutdown = (exitProcess: boolean): Promise<void> => {
+    // The exit boundary is idempotent and reached from three places: the end
+    // of the dispose chain, the chain's rejection, and a hard fallback timer
+    // — a turn that ran can leave a dispose step unresolved, and the process
+    // must never hang with the terminal already torn down.
+    let exitedRuntime = false
+    const finish = (): void => {
+      if (!exitProcess || exitedRuntime) return
+      exitedRuntime = true
+      if (runtime.goodbyeMessage !== undefined) {
+        runtime.terminal.write(`${palette.dim(displayText(runtime.goodbyeMessage))}\n`)
+      }
+      runtime.exit(0)
+    }
     shuttingDown ??= (async () => {
       disposed = true
       overlayManager.beginShutdown()
@@ -1223,13 +1303,12 @@ export function createTuiChat(
       questions.unregister()
       await runtime.terminal.drainInput(100, 20)
       ui.stop()
-      if (exitProcess) {
-        if (runtime.goodbyeMessage !== undefined) {
-          runtime.terminal.write(`${palette.dim(displayText(runtime.goodbyeMessage))}\n`)
-        }
-        runtime.exit(0)
-      }
+      finish()
     })()
+    if (exitProcess) {
+      void shuttingDown.catch(() => {}).then(finish)
+      setTimeout(finish, SHUTDOWN_EXIT_FALLBACK_MS)
+    }
     return shuttingDown
   }
 
@@ -2028,13 +2107,13 @@ export function createTuiChat(
       } else if (editor.getText() !== '') {
         editor.setText('')
       } else {
-        requestExit()
+        doublePressExit('ctrl+c')
       }
       return { consume: true }
     }
     if (matchesKey(data, Key.ctrl('d'))) {
       if (agent.status === 'running') appendNotice('Cancel the active turn before exiting.', 'warning')
-      else requestExit()
+      else doublePressExit('ctrl+d')
       return { consume: true }
     }
     return undefined

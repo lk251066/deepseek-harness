@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { createToolResultMessage, CallId } from '@deepseek-ai/dsh-llm'
 import { ContextCardComponent, ToolCardComponent } from '../src/components/transcript.ts'
+import { TOOL_SETTLED } from '../src/components/figures.ts'
 import { parseArguments } from '../src/components/content.ts'
 import { createPalette, markdownTheme } from '../src/components/theme.ts'
 
@@ -41,7 +42,7 @@ describe('transcript card render caches', () => {
     card.updateResult(toolResult('output line'))
     const settled = card.render(80)
     expect(settled).not.toBe(pending)
-    expect(settled.join('\n')).toContain('⏺')
+    expect(settled.join('\n')).toContain(TOOL_SETTLED())
     expect(settled.join('\n')).toContain('⎿ output line')
 
     card.setVisibility('hidden')

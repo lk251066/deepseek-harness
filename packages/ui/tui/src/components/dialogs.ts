@@ -171,18 +171,40 @@ export function diagnosticMeter(percent: number, palette: Palette): string {
   return `${palette.dim('[')}${palette.accent('█'.repeat(filled))}${palette.dim(`${'░'.repeat(width - filled)}]`)}`
 }
 
+/** Options for {@link contextMeter}; none keeps the legacy bar-only rendering. */
+export interface ContextMeterOptions {
+  /** Append the occupancy percentage beside the bar, colored by the same pressure tier. */
+  readonly percent?: boolean
+}
+
 /**
  * Compact 10-cell context-occupancy bar for the prompt row: fill colored by
  * pressure (dim below 60%, warning to 85%, error above), remainder recessed.
+ * With `options.percent` the percentage number joins the bar in the same
+ * tier color, the way Claude Code's context meter keeps number and bar in one
+ * tone; thresholds stay local here (60/85) until the shared module lands.
  */
-export function contextMeter(percent: number, palette: Palette): string {
+export function contextMeter(percent: number, palette: Palette, options?: ContextMeterOptions): string {
   const width = 10
   const clamped = Math.min(100, Math.max(0, percent))
   const filled = Math.round(clamped / 100 * width)
   const color = clamped >= 85 ? palette.error : clamped >= 60 ? palette.warning : palette.dim
   // An empty fill renders no escape pair at all (an empty-colored span is an
   // empty dim pair, which downstream consumers treat as a leak).
-  return `${filled > 0 ? color('█'.repeat(filled)) : ''}${palette.dim('░'.repeat(width - filled))}`
+  const bar = `${filled > 0 ? color('█'.repeat(filled)) : ''}${palette.dim('░'.repeat(width - filled))}`
+  if (options?.percent !== true) return bar
+  return `${bar} ${color(`${Math.round(clamped)}%`)}`
+}
+
+/**
+ * Resolve the 0-based option index a `1`-`9` digit key addresses in a select
+ * dialog, mirroring Claude Code's number-key direct selection.
+ * @param data - Raw key data.
+ * @returns The index, or `undefined` when the key is not a digit 1-9.
+ */
+function digitIndex(data: string): number | undefined {
+  if (data.length !== 1 || data < '1' || data > '9') return undefined
+  return data.charCodeAt(0) - '1'.charCodeAt(0)
 }
 
 /** One `label: value` row of a status card group. */
@@ -644,9 +666,12 @@ export class RenameDialog implements Component {
 }
 
 /**
- * A two-option confirmation (Confirm / Cancel) for risky actions — the
- * danger-permission acknowledgement, mirroring the web RiskConfirmation modal.
- * Esc and Ctrl+C cancel.
+ * A two-option confirmation (No / Yes) for risky actions — the
+ * danger-permission acknowledgement, mirroring Claude Code's bypass-permissions
+ * dialog: the safe `No` item is FIRST and focused at open, so Enter alone never
+ * accepts the risk. A `\n`-separated message renders its first line as an
+ * error-colored warning title and the rest as the warning body. Esc and Ctrl+C
+ * cancel.
  */
 export class ConfirmDialog implements Component {
   private readonly list: SelectList
@@ -657,12 +682,15 @@ export class ConfirmDialog implements Component {
     private readonly palette: Palette,
     private readonly choose: (confirmed: boolean) => void,
     private readonly close: () => void,
+    /** Item focused at open: 0 is the safe `No` item (the default), 1 the risky `Yes` item. */
+    defaultIndex = 0,
   ) {
     const items: SelectItem[] = [
-      { value: 'confirm', label: 'Confirm', description: 'proceed' },
-      { value: 'cancel', label: 'Cancel', description: 'keep the current setting' },
+      { value: 'cancel', label: 'No, keep restrictions', description: 'keep the current setting' },
+      { value: 'confirm', label: 'Yes, I accept', description: 'proceed' },
     ]
     this.list = new SelectList(items, 2, dialogSelectTheme(palette))
+    this.list.setSelectedIndex(Math.max(0, Math.min(defaultIndex, items.length - 1)))
     this.list.onSelect = (item) => {
       this.choose(item.value === 'confirm')
       this.close()
@@ -689,12 +717,22 @@ export class ConfirmDialog implements Component {
 
   render(width: number): string[] {
     const innerWidth = Math.max(1, width - 4)
+    const lines = this.message.split('\n')
+    const messageLines = lines.length === 1
+      ? new Text(this.palette.warning(displayText(this.message)), 0, 0).render(innerWidth)
+      : [
+        // A multi-line message is the Claude-Code-style warning: an error-toned
+        // title line over a warning-toned body.
+        ...new Text(this.palette.error(displayText(lines[0] as string)), 0, 0).render(innerWidth),
+        ...lines.slice(1).flatMap(bodyLine =>
+          new Text(this.palette.warning(displayText(bodyLine)), 0, 0).render(innerWidth)),
+      ]
     return renderDialog(this.title, [
-      ...new Text(this.palette.warning(this.message), 0, 0).render(innerWidth),
+      ...messageLines,
       '',
       ...this.list.render(innerWidth),
       '',
-      this.palette.dim('↑/↓ move • Enter confirm • Esc cancel'),
+      this.palette.dim('↑/↓ move • Enter select • Esc cancel'),
     ], width, this.palette)
   }
 }
@@ -704,12 +742,15 @@ export type ApprovalChoice = 'allow-once' | 'escalate' | 'reject'
 
 /**
  * The tool-approval prompt: a Claude-Code-style takeover above the editor while
- * a tool call waits on the user's decision. Enter picks an option; Esc and
- * Ctrl+C reject (the turn keeps running so the model sees the denial).
+ * a tool call waits on the user's decision. Options carry dim `N.` prefixes and
+ * digit keys 1-9 pick them directly; Enter picks the highlighted option; Esc
+ * and Ctrl+C reject (the turn keeps running so the model sees the denial).
  */
 export class ApprovalDialog implements Component {
   private readonly list: SelectList
   private readonly headline: readonly string[]
+  /** Answer values in list order, addressed by the 1-9 digit keys. */
+  private readonly choices: readonly ApprovalChoice[]
 
   constructor(
     toolName: string,
@@ -720,13 +761,19 @@ export class ApprovalDialog implements Component {
     private readonly choose: (choice: ApprovalChoice) => void,
     private readonly close: () => void,
   ) {
-    const items: SelectItem[] = [
+    const entries: ReadonlyArray<{ value: ApprovalChoice; label: string; description: string }> = [
       { value: 'allow-once', label: 'Allow once', description: 'run this call' },
       ...escalateLabel === undefined ? [] : [{
-        value: 'escalate', label: escalateLabel, description: 'stop asking for this session',
+        value: 'escalate' as const, label: escalateLabel, description: 'stop asking for this session',
       }],
       { value: 'reject', label: 'Reject', description: 'deny the call' },
     ]
+    this.choices = entries.map(entry => entry.value)
+    const items: SelectItem[] = entries.map((entry, index) => ({
+      value: entry.value,
+      label: `${this.palette.dim(`${index + 1}. `)}${displayText(entry.label)}`,
+      description: entry.description,
+    }))
     this.list = new SelectList(items, items.length, dialogSelectTheme(palette))
     this.list.setSelectedIndex(0)
     this.list.onSelect = (item) => {
@@ -753,9 +800,20 @@ export class ApprovalDialog implements Component {
     if (matchesKey(data, Key.ctrl('c'))) {
       this.choose('reject')
       this.close()
-    } else {
-      this.list.handleInput(data)
+      this.invalidate()
+      return
     }
+    // Every option is visible at once, so 1-9 address the list directly; an
+    // out-of-range digit falls through to the list, which ignores it.
+    const digit = digitIndex(data)
+    const choice = digit === undefined ? undefined : this.choices[digit]
+    if (choice !== undefined) {
+      this.choose(choice)
+      this.close()
+      this.invalidate()
+      return
+    }
+    this.list.handleInput(data)
     this.invalidate()
   }
 
@@ -767,7 +825,7 @@ export class ApprovalDialog implements Component {
       ...wrapped,
       ...this.list.render(innerWidth),
       '',
-      this.palette.dim('↑/↓ move • Enter confirm • Esc/Ctrl+C reject'),
+      this.palette.dim('↑/↓ move • 1-9 select • Enter confirm • Esc/Ctrl+C reject'),
     ], width, this.palette)
   }
 }
@@ -1149,6 +1207,13 @@ export class QuestionDialog implements Component, Focusable {
   private selected = new Set<number>()
   private headerPage: SelectedBlockPage = { offset: 0, size: 1, maxOffset: 0 }
   private selectedBlockPage: SelectedBlockPage = { offset: 0, size: 1, maxOffset: 0 }
+  /**
+   * The option index window the last render showed, `[start, end)`. Digit keys
+   * 1-9 address the RENDERED `N.` numbers — absolute option indices — and only
+   * inside this window; until a first render narrows it, all options count as
+   * visible.
+   */
+  private visibleRange: { start: number; end: number }
   private mode: 'options' | 'custom'
   private error = ''
   private readonly input = new Input()
@@ -1167,6 +1232,7 @@ export class QuestionDialog implements Component, Focusable {
     private readonly cancel: () => void,
   ) {
     this.options = question.options ?? []
+    this.visibleRange = { start: 0, end: this.options.length }
     this.mode = this.options.length > 0 ? 'options' : 'custom'
     this.input.onSubmit = (value) => { this.submitCustom(value) }
     this.input.onEscape = () => {
@@ -1199,6 +1265,11 @@ export class QuestionDialog implements Component, Focusable {
       return
     }
     const options = this.options
+    const digit = digitIndex(data)
+    if (digit !== undefined) {
+      this.selectByDigit(digit)
+      return
+    }
     if (matchesKey(data, Key.up)) {
       this.selectedBlockPage = { offset: 0, size: 1, maxOffset: 0 }
       this.selectedIndex = this.selectedIndex === 0 ? options.length - 1 : this.selectedIndex - 1
@@ -1209,15 +1280,7 @@ export class QuestionDialog implements Component, Focusable {
       if (this.selected.has(this.selectedIndex)) this.selected.delete(this.selectedIndex)
       else this.selected.add(this.selectedIndex)
     } else if (matchesKey(data, Key.enter)) {
-      const selected = this.question.multiSelect
-        ? this.selectedOptionLabels()
-        : [options[this.selectedIndex]?.label].filter((label): label is string => label !== undefined)
-      const custom = this.question.multiSelect ? this.input.getValue().trim() : ''
-      if (selected.length === 0 && custom === '') {
-        this.error = 'Select at least one option, or press Tab for a custom answer.'
-        return
-      }
-      this.done({ selected, ...(custom === '' ? {} : { custom }) })
+      this.submitOptions()
     } else if (matchesKey(data, Key.tab) || data.toLowerCase() === 'c') {
       this.mode = 'custom'
       this.selectedBlockPage = { offset: 0, size: 1, maxOffset: 0 }
@@ -1225,6 +1288,36 @@ export class QuestionDialog implements Component, Focusable {
     } else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl('c'))) {
       this.cancel()
     }
+  }
+
+  /** Submit the options-mode selection (Enter, and digit direct-select on single-select questions). */
+  private submitOptions(): void {
+    const options = this.options
+    const selected = this.question.multiSelect
+      ? this.selectedOptionLabels()
+      : [options[this.selectedIndex]?.label].filter((label): label is string => label !== undefined)
+    const custom = this.question.multiSelect ? this.input.getValue().trim() : ''
+    if (selected.length === 0 && custom === '') {
+      this.error = 'Select at least one option, or press Tab for a custom answer.'
+      return
+    }
+    this.done({ selected, ...(custom === '' ? {} : { custom }) })
+  }
+
+  /**
+   * Apply a 1-9 direct-select key to the option rendered with that number:
+   * single-select confirms the option (move + Enter in one key), multi-select
+   * toggles its checkmark. A number outside the rendered window is ignored.
+   */
+  private selectByDigit(index: number): void {
+    if (index < this.visibleRange.start || index >= this.visibleRange.end) return
+    if (this.question.multiSelect) {
+      if (this.selected.has(index)) this.selected.delete(index)
+      else this.selected.add(index)
+      return
+    }
+    this.selectedIndex = index
+    this.submitOptions()
   }
 
   private submitCustom(value: string): void {
@@ -1353,6 +1446,9 @@ export class QuestionDialog implements Component, Focusable {
     } else {
       const optionBlocks = this.options.map((option, index) => this.renderOptionBlock(option, index, innerWidth))
       const { visibleBlocks, hiddenBefore, hiddenAfter } = this.windowBlocks(optionBlocks, availableForOptions, innerWidth)
+      // The digit keys address what this render actually shows, so the input
+      // handler reads the window back from here.
+      this.visibleRange = { start: hiddenBefore, end: this.options.length - hiddenAfter }
       if (hiddenBefore > 0) optionLines.push(this.palette.dim(`↑ ${hiddenBefore} more`))
       for (const block of visibleBlocks) {
         for (const line of block) optionLines.push(line)

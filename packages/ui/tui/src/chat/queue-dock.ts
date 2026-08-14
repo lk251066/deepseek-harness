@@ -17,6 +17,11 @@ export interface QueueDockDeps extends ChatChannelDeps, ChannelNotice {
   agent: Agent
   /** Load a message body into the editor for editing (the caller owns the editor). */
   loadIntoEditor(text: string): void
+  /**
+   * Show an operation receipt in the transient notice slot; absent falls back
+   * to the persistent transcript notice.
+   */
+  showTransientNotice?(message: string): void
 }
 
 /** Queue-dock controller for one chat channel. */
@@ -27,6 +32,15 @@ export interface QueueDockController {
   refresh(): void
   /** Open the `/queue` management sheet. */
   showSheet(): void
+  /** How many messages currently wait in the inbox lanes. */
+  pendingCount(): number
+  /**
+   * Pop the newest queued message back into the editor for editing (empty-input
+   * ↑): arms the same submit-replaces-queued-message target the sheet's edit
+   * path uses. The message stays queued until the edit is submitted.
+   * @returns whether a queued message was armed and loaded.
+   */
+  armLatestForEdit(): boolean
   /**
    * A pending edit target: when set, the next submit replaces this queued
    * message rather than dispatching a new turn; cleared after one submit.
@@ -54,12 +68,16 @@ export function createQueueDock(deps: QueueDockDeps): QueueDockController {
     lane,
   })
 
+  /** Live inbox lanes, or `undefined` for agents without the inbox projection. */
+  const inboxLanes = (): { readonly nextStep: readonly UserMessage[]; readonly nextTurn: readonly UserMessage[] } | undefined =>
+    (agent as {
+      inbox?: { readonly nextStep: readonly UserMessage[]; readonly nextTurn: readonly UserMessage[] }
+    }).inbox
+
   const entries = (): QueueEntry[] => {
     // Test/embedder agents may not carry the inbox projection; an absent
     // inbox renders an empty dock rather than throwing on every refresh.
-    const inbox = (agent as {
-      inbox?: { readonly nextStep: readonly UserMessage[]; readonly nextTurn: readonly UserMessage[] }
-    }).inbox
+    const inbox = inboxLanes()
     if (inbox === undefined) return []
     return [
       ...inbox.nextStep.map(message => entryOf(message, 'step')),
@@ -92,7 +110,10 @@ export function createQueueDock(deps: QueueDockDeps): QueueDockController {
           (entry) => {
             try {
               agent.inbox.remove(entry.id as MessageId)
-              deps.appendNotice('Queued message removed.')
+              // A removal receipt is pure operation feedback: transient when the
+              // channel offers the notice slot, persistent otherwise.
+              if (deps.showTransientNotice !== undefined) deps.showTransientNotice('Queued message removed.')
+              else deps.appendNotice('Queued message removed.')
             } catch (error) {
               deps.appendNotice(`Failed to remove the queued message: ${String(error)}`, 'error')
             }
@@ -102,6 +123,22 @@ export function createQueueDock(deps: QueueDockDeps): QueueDockController {
         options: { width: 76, anchor: 'center', margin: 1 },
       })
       deps.requestRender()
+    },
+    pendingCount(): number {
+      const inbox = inboxLanes()
+      return inbox === undefined ? 0 : inbox.nextStep.length + inbox.nextTurn.length
+    },
+    armLatestForEdit(): boolean {
+      const inbox = inboxLanes()
+      if (inbox === undefined) return false
+      // The imminent step lane first: its tail is the newest message joining
+      // the running step, else the newest message waiting for the next turn.
+      const message = inbox.nextStep[inbox.nextStep.length - 1]
+        ?? inbox.nextTurn[inbox.nextTurn.length - 1]
+      if (message === undefined) return false
+      editTarget = message
+      deps.loadIntoEditor(contentText(message.content))
+      return true
     },
     takeEditTarget(): UserMessage | undefined {
       const target = editTarget

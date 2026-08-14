@@ -111,6 +111,7 @@ import {
   UserMessageComponent,
 } from './components/transcript.ts'
 import { FramedEditorComponent } from './components/framed-editor.ts'
+import { NoticeSlotComponent, type NoticeKind } from './components/notice-slot.ts'
 import { WorkingLineComponent } from './components/working-line.ts'
 import { logoFullWidth, logoSingleWordWidth, SHIMMER_INTERVAL_MS, SHIMMER_WIDTH } from './components/logo.ts'
 import { pickSpinnerVerb } from './chat/spinner-verbs.ts'
@@ -638,6 +639,16 @@ export function createTuiChat(
     requestRender()
   }
 
+  // Claude Code's Notifications slot: one transient row at the very bottom for
+  // lightweight operation receipts (state-switch feedback) that must not
+  // pollute the durable transcript. Errors, warnings, and anything the user
+  // may need to scroll back to keep going through appendNotice.
+  const noticeSlot = new NoticeSlotComponent(palette, requestRender)
+  ui.addChild(noticeSlot)
+  const showTransientNotice = (message: string, kind: NoticeKind = 'info'): void => {
+    noticeSlot.show(message, kind)
+  }
+
   const extensionTheme: TuiTheme = Object.freeze({
     text: (value: string) => palette.text(value),
     brand: (value: string) => resolved.theme.color
@@ -732,6 +743,7 @@ export function createTuiChat(
       editor.setText(text)
       requestRender()
     },
+    showTransientNotice,
   })
   docks.addChild(goalBar.component)
   docks.addChild(queueDock.component)
@@ -798,6 +810,38 @@ export function createTuiChat(
     fadingStatus = fading
   }
 
+  /** Status-priority placeholder text for the empty editor (dim; the hint editor paints it). */
+  const editorHintFor = (status: AgentStatus): string => {
+    if (status === 'running') return palette.dim(displayInlineText(resolved.theme.inputPlaceholder))
+    if (foldPlanMode(agent.session.events)) {
+      return palette.dim('plan mode — present a plan; the review runs before any edit')
+    }
+    // Queued messages are more actionable than examples: ↑ pops the newest
+    // one back into the editor (see the input listener's Key.up branch).
+    if (queueDock.pendingCount() > 0) return palette.dim('press ↑ to edit queued messages')
+    return palette.dim('type / for commands, @ for files')
+  }
+
+  /**
+   * Re-derive the editor placeholder from the live status, plan mode, and
+   * queue. The Ctrl+C/Ctrl+D exit arm hint outranks every status-derived hint
+   * for the lifetime of its window; the disarm timeout re-applies this.
+   */
+  const applyEditorHint = (): void => {
+    if (exitArmedAt !== undefined) return
+    editor.hint = editorHintFor(agent.status)
+  }
+
+  /**
+   * Re-derive the queue dock from the inbox and refresh the editor hint with
+   * it: the queue-emptying/queue-filling edge is exactly when the idle
+   * placeholder flips between the queue hint and the examples hint.
+   */
+  const refreshQueueDock = (): void => {
+    queueDock.refresh()
+    applyEditorHint()
+  }
+
   const setStatus = (status: AgentStatus): void => {
     const priorTurn = runningStatus?.turn
     const fadeOutGlyph = status !== 'running' ? runningStatus?.lastGlyph : undefined
@@ -805,12 +849,9 @@ export function createTuiChat(
     else if (fadeOutGlyph !== undefined) beginFadeOut(fadeOutGlyph)
     else clearTurnStatus()
     editor.borderColor = status === 'running' ? text => palette.accent(text) : text => palette.dim(text)
-    // Running keeps the steering placeholder; idle plan mode carries its own.
-    editor.hint = status === 'running'
-      ? palette.dim(displayInlineText(resolved.theme.inputPlaceholder))
-      : foldPlanMode(agent.session.events)
-        ? palette.dim('plan mode — present a plan; the review runs before any edit')
-        : undefined
+    // Running keeps the steering placeholder; idle plan mode carries its own;
+    // plain idle carries the queue hint or the example-commands hint.
+    applyEditorHint()
     if (status === 'running') {
       const turn = priorTurn ?? openTurn(agent.session.events)
       const running: RunningStatus = {
@@ -1259,11 +1300,11 @@ export function createTuiChat(
     editor.hint = palette.dim(`press ${key} again to exit`)
     requestRender()
     setTimeout(() => {
-      // Disarm quietly once the window lapses; setStatus restores the
-      // state-appropriate hint (idle has none).
+      // Disarm quietly once the window lapses; restore the state-appropriate
+      // placeholder (steer / plan / queue / examples).
       if (exitArmedAt !== undefined && now() - exitArmedAt >= EXIT_DOUBLE_PRESS_MS) {
         exitArmedAt = undefined
-        editor.hint = undefined
+        applyEditorHint()
         requestRender()
       }
     }, EXIT_DOUBLE_PRESS_MS + 50)
@@ -1358,7 +1399,8 @@ export function createTuiChat(
     // Hidden mode folds each turn's steps into one assistant message; other
     // modes restore the per-step Assistant headers.
     for (const turn of assistantSteps.keys()) applyTurnFolding(turn)
-    appendNotice(toolsVisibility === 'hidden' ? 'Tool cards hidden.' : `Tool and context cards ${toolsVisibility}.`)
+    // State-switch feedback: transient receipt, not transcript history.
+    showTransientNotice(toolsVisibility === 'hidden' ? 'Tool cards hidden.' : `Tool and context cards ${toolsVisibility}.`)
   }
 
   const toggleTools = (): void => {
@@ -1379,7 +1421,8 @@ export function createTuiChat(
       registerAssistantStep(activeStreaming)
       chat.addChild(activeStreaming)
     }
-    appendNotice(`Reasoning ${showReasoning ? 'expanded' : 'collapsed'}.`)
+    // State-switch feedback: transient receipt, not transcript history.
+    showTransientNotice(`Reasoning ${showReasoning ? 'expanded' : 'collapsed'}.`)
   }
 
   const toggleReasoning = (): void => { setReasoning(!showReasoning) }
@@ -1443,7 +1486,7 @@ export function createTuiChat(
     }
     try {
       titles.rename(agent.session, title)
-      appendNotice(`Session renamed to "${title}".`)
+      showTransientNotice(`Session renamed to "${title}".`)
     } catch (error) {
       appendNotice(`Rename failed: ${errorChain(error)}`, 'error')
     }
@@ -1815,7 +1858,7 @@ export function createTuiChat(
         }
         try {
           const path = writeExport(cwd, agent.session)
-          appendNotice(`Exported to ${path}`)
+          showTransientNotice(`Exported to ${path}`)
         } catch (error) {
           appendNotice(`Export failed: ${errorChain(error)}`, 'error')
         }
@@ -1971,11 +2014,11 @@ export function createTuiChat(
       if (entry.subtree?.refresh !== undefined) refreshes.push(entry.subtree.refresh())
     }
     reloadInFlight = true
-    appendNotice(`Reloading ${refreshes.length} config tree(s)… (experimental)`)
+    showTransientNotice(`Reloading ${refreshes.length} config tree(s)… (experimental)`)
     // refresh() never rejects (it warns and keeps the running tree), so the
     // join can only fulfill; the catch arm guards a future contract change.
     void Promise.all(refreshes).then(() => {
-      appendNotice('Config reload complete. Unchanged files were skipped; invalid files keep the running tree (see logs).')
+      showTransientNotice('Config reload complete. Unchanged files were skipped; invalid files keep the running tree (see logs).')
     }).catch((error: unknown) => {
       appendNotice(`Config reload failed: ${errorChain(error)}`, 'error')
     }).finally(() => {
@@ -1997,7 +2040,7 @@ export function createTuiChat(
       const replacement = replaceQueuedMessage(editTarget, [{ type: 'text', text }])
       if (agent.inbox.replace(editTarget.id, replacement)) {
         pendingSteering.add(replacement.id)
-        appendNotice('Queued message updated.')
+        showTransientNotice('Queued message updated.')
       } else if (agent.status === 'running') {
         // The target left the queue while editing; deliver as fresh steering.
         agent.steer(replacement)
@@ -2005,7 +2048,7 @@ export function createTuiChat(
       } else {
         agent.followup(replacement)
       }
-      queueDock.refresh()
+      refreshQueueDock()
       refreshStatus()
       return
     }
@@ -2074,6 +2117,21 @@ export function createTuiChat(
 
   const removeInputListener = ui.addInputListener((data) => {
     if (overlayManager.hasActiveOverlay()) return undefined
+    // Empty-input ↑ with queued messages pops the newest queued message back
+    // into the editor (Claude Code's queue editing): the next submit REPLACES
+    // it through the same armed-edit path the /queue sheet uses. With nothing
+    // queued (or the editor non-empty) ↑ falls through to the editor's own
+    // prompt history / cursor movement. An open autocomplete menu keeps ↑ for
+    // itself.
+    if (
+      matchesKey(data, Key.up)
+      && editor.focused
+      && editor.getText() === ''
+      && !editor.isShowingAutocomplete()
+      && queueDock.armLatestForEdit()
+    ) {
+      return { consume: true }
+    }
     // Shift+Tab cycles permission presets (Claude Code's mode ring); the
     // danger preset confirms through the risk dialog first.
     if (matchesKey(data, Key.shift(Key.tab))) {
@@ -2127,7 +2185,7 @@ export function createTuiChat(
     // Docks re-derive from the log: the goal bar on goal changes, the queue
     // dock on inbox-affecting events; plan-mode switches re-derive the hint.
     if (event.type === 'goal/change' || event.type === 'turn/start') goalBar.refresh()
-    if (event.type === 'agent/inbox/spliced' || event.type === 'user/message') queueDock.refresh()
+    if (event.type === 'agent/inbox/spliced' || event.type === 'user/message') refreshQueueDock()
     if (event.type === 'plan/mode' || event.type === 'permission/preset') setStatus(agent.status)
     // Track live standalone compaction state.
     if (event.type === 'compaction/start' && event.data.turn === null) {
@@ -2176,7 +2234,7 @@ export function createTuiChat(
     if (pendingSteering.delete(message.id)) refreshStatus()
   })
   const disposeInserted = ctx.on('agent/inbox/inserted', ({ agent: source }) => {
-    if (source === agent) queueDock.refresh()
+    if (source === agent) refreshQueueDock()
   })
   const disposeStatus = ctx.on('agent/status', ({ agent: source, status }) => {
     if (source !== agent) return
@@ -2210,6 +2268,7 @@ export function createTuiChat(
   const detachListeners = (): void => {
     skillAbort.abort()
     fileSearch.dispose()
+    noticeSlot.dispose()
     removeInputListener()
     disposeCommandChanges()
     disposeSkillChanges()
@@ -2294,7 +2353,7 @@ export function createTuiChat(
 
   rebuildTranscript(true)
   goalBar.refresh()
-  queueDock.refresh()
+  refreshQueueDock()
   const restoredGoal = foldGoal(agent.session.events).goal
   /* v8 ignore next -- goal replay coverage lives with the goal seam; the TUI only formats its startup notice. */
   if (restoredGoal !== undefined && restoredGoal.phase !== 'complete') {

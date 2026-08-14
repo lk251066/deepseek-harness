@@ -2144,6 +2144,83 @@ describe('pi-tui chat lifecycle and transcript', () => {
     await dispose(result)
   })
 
+  it('shows idle example and queue placeholder hints and pops queued messages into the editor with ↑', async () => {
+    const result = await setup()
+    // Idle, plan-free, empty editor: the examples hint shows.
+    expect(result.terminal.output).toContain('type / for commands, @ for files')
+
+    // A queued message flips the hint to the queue hint on the next refresh.
+    result.inbox.seed('next-step', [
+      freezeMessage(createUserMessage({
+        content: [{ type: 'text', text: 'first queued attempt' }],
+        source: { kind: 'user' },
+      })),
+      freezeMessage(createUserMessage({
+        content: [{ type: 'text', text: 'second queued attempt' }],
+        source: { kind: 'user' },
+      })),
+    ])
+    result.terminal.output = ''
+    agentEvents(result.ctx, result.agent).emit('agent/inbox/inserted', {
+      message: result.inbox.nextStep[1]!,
+    })
+    await tick()
+    expect(result.terminal.output).toContain('press ↑ to edit queued messages')
+
+    // Typing hides the hint; the editor holds real text.
+    result.terminal.output = ''
+    result.terminal.send('x')
+    await tick()
+    expect(result.terminal.output).not.toContain('press ↑ to edit queued messages')
+
+    // Empty-input ↑ loads the NEWEST queued message; the loaded body renders.
+    result.terminal.send('\x7f')
+    result.terminal.output = ''
+    result.terminal.send('\x1b[A')
+    await tick()
+    expect(result.terminal.output).toContain('second queued attempt')
+    expect(result.inbox.nextStep).toHaveLength(2)
+
+    // Submitting replaces the armed queued message instead of sending: the
+    // inbox keeps two entries with the newest one rewritten, and the receipt
+    // lands in the transient slot.
+    result.terminal.output = ''
+    result.terminal.send(' second edit')
+    result.terminal.send('\r')
+    await tick()
+    expect(result.terminal.output).toContain('Queued message updated.')
+    expect(result.agent.sent).toEqual([])
+    expect(result.inbox.nextStep).toHaveLength(2)
+    expect(result.inbox.nextStep[1]!.content).toEqual([
+      { type: 'text', text: 'second queued attempt second edit' },
+    ])
+
+    // With the queue drained, the hint returns to the examples hint.
+    result.inbox.clear()
+    agentEvents(result.ctx, result.agent).emit('agent/inbox/inserted', {
+      message: freezeMessage(createUserMessage({
+        content: [{ type: 'text', text: 'gone' }],
+        source: { kind: 'user' },
+      })),
+    })
+    await tick()
+    expect(result.terminal.output).toContain('type / for commands, @ for files')
+
+    // An empty step lane falls back to the newest next-turn message.
+    result.inbox.seed('next-turn', [
+      freezeMessage(createUserMessage({
+        content: [{ type: 'text', text: 'queued for next turn' }],
+        source: { kind: 'user' },
+      })),
+    ])
+    result.terminal.output = ''
+    result.terminal.send('\x1b[A')
+    await tick()
+    expect(result.terminal.output).toContain('queued for next turn')
+
+    await dispose(result)
+  })
+
 
 
 
@@ -2862,9 +2939,12 @@ describe('pi-tui chat lifecycle and transcript', () => {
     await run('/details hidden')
     expect(result.terminal.output).toContain('Tool cards hidden.')
 
+    // One command, two receipts: the transient notice slot shows only the
+    // latest, so 'Reasoning collapsed.' is swallowed by the visibility receipt
+    // here — its coverage lives in the dedicated `/details reasoning` step
+    // below, which fires the reasoning receipt alone.
     await run('/details expanded reasoning off')
     expect(result.terminal.output).toContain('Tool and context cards expanded.')
-    expect(result.terminal.output).toContain('Reasoning collapsed.')
 
     await run('/details reasoning on')
     expect(result.terminal.output).toContain('Reasoning expanded.')
@@ -2963,6 +3043,9 @@ describe('pi-tui chat lifecycle and transcript', () => {
     result.terminal.send('\x04')
     result.terminal.send('\x03')
     result.terminal.send('\x12')
+    // Let the transient 'Reasoning expanded.' receipt render before Ctrl+O's
+    // receipt replaces it in the single notice slot.
+    await tick()
     result.terminal.send('\x0f')
     expect(result.agent.cancelled).toContainEqual({ kind: 'user' })
 

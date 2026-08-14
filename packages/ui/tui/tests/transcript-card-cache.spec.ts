@@ -36,10 +36,13 @@ describe('transcript card render caches', () => {
   it('tool card: result, visibility, and invalidate() each drop the cache', () => {
     const card = toolCard()
     const pending = card.render(80)
+    // Pending headers carry the hollow marker until the first spinner frame.
+    expect(pending.join('\n')).toContain('○')
     card.updateResult(toolResult('output line'))
     const settled = card.render(80)
     expect(settled).not.toBe(pending)
-    expect(settled.join('\n')).toContain('●')
+    expect(settled.join('\n')).toContain('⏺')
+    expect(settled.join('\n')).toContain('⎿ output line')
 
     card.setVisibility('hidden')
     expect(card.render(80)).toEqual([])

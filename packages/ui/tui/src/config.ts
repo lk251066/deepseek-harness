@@ -18,6 +18,8 @@ export interface TuiThemeConfig {
   color?: boolean
   /** Paint the startup banner with the 24-bit DeepSeek brand gradient. */
   truecolor?: boolean
+  /** Named color preset (`/theme`); the default adapts to the terminal's own scheme. */
+  name?: string
   /** Left-aligned template on the row above the editor. */
   leftPrompt?: string
   /** Right-aligned template on the row above the editor. */
@@ -87,6 +89,8 @@ const showHardwareCursorSchema = z.boolean().default(false)
 const colorSchema = z.boolean().default(true)
 // No default: an unset value auto-detects truecolor from COLORTERM in `apply`.
 const truecolorSchema = z.boolean()
+// No default: an unset theme name means the adaptive default (`deepseek`).
+const themeNameSchema = z.string()
 const DEFAULT_LEFT_PROMPT = '${cwd}${git/worktree}${model}${token_meter/cache_hit_rate}${context}'
 const DEFAULT_RIGHT_PROMPT = '${queued}'
 const DEFAULT_INPUT_PROMPT = '${symbol} ${indicator}'
@@ -94,6 +98,7 @@ const DEFAULT_INPUT_PLACEHOLDER = 'press enter to steer and esc to cancel'
 const TuiThemeConfigSchema: z<TuiThemeConfig> = z.object({
   color: colorSchema,
   truecolor: truecolorSchema,
+  name: themeNameSchema,
   leftPrompt: z.string().default(DEFAULT_LEFT_PROMPT),
   rightPrompt: z.string().default(DEFAULT_RIGHT_PROMPT),
   inputPrompt: z.string().default(DEFAULT_INPUT_PROMPT),
@@ -168,6 +173,8 @@ export const Config: z<Config> = z.object({
 export interface ResolvedTuiThemeConfig {
   color: boolean
   truecolor: boolean
+  /** Named color preset; `deepseek` (adaptive) when unset or unknown. */
+  name: string
   leftPrompt: string
   rightPrompt: string
   inputPrompt: string
@@ -223,6 +230,7 @@ export function resolveTuiConfig(config: TuiConfig | undefined): ResolvedTuiConf
     theme: {
       color: config?.theme?.color ?? true,
       truecolor: config?.theme?.truecolor ?? false,
+      name: config?.theme?.name ?? 'deepseek',
       leftPrompt: config?.theme?.leftPrompt ?? DEFAULT_LEFT_PROMPT,
       rightPrompt: config?.theme?.rightPrompt ?? DEFAULT_RIGHT_PROMPT,
       inputPrompt: config?.theme?.inputPrompt ?? DEFAULT_INPUT_PROMPT,

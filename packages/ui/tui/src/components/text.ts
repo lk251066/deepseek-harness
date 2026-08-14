@@ -5,6 +5,8 @@
  * @module @deepseek-ai/dsh-tui/components/text
  */
 
+import { hyperlink } from '@earendil-works/pi-tui'
+
 const TERMINAL_CONTROL_PATTERN = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/gu
 const TERMINAL_OSC_PATTERN = /(?:\u001B\]|\u009D)(?:(?!\u0007|\u001B\\)[\s\S])*(?:\u0007|\u001B\\|$)/gu
 const TERMINAL_CSI_PATTERN = /(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/gu
@@ -15,15 +17,31 @@ export const BRACKETED_PASTE_START = '\u001B[200~'
 /** Bracketed-paste end marker emitted by terminals around pasted content. */
 export const BRACKETED_PASTE_END = '\u001B[201~'
 
+/** Bare http(s) URLs in escaped text, wrapped as OSC 8 terminal hyperlinks. */
+const BARE_URL_PATTERN = /\bhttps?:\/\/[^\s<>"'`)\]}]+/gu
+/** Sentence punctuation a URL match may swallow but must not link. */
+const TRAILING_URL_PUNCTUATION = '.,;:!?)]}'
+
 /**
- * Escape external C0/C1 controls before pi-tui adds application-owned ANSI.
- * Line feeds remain structural so transcript and tool output retain their layout.
+ * Escape external C0/C1 controls before pi-tui adds application-owned ANSI, and
+ * wrap bare http(s) URLs in OSC 8 hyperlinks so capable terminals make them
+ * clickable (others print the visible text unchanged; pi-tui's width, wrap, and
+ * truncate utilities skip the sequences). Line feeds remain structural so
+ * transcript and tool output retain their layout.
  * @param text - Untrusted text to render.
- * @returns The text with control characters escaped as `\xNN`.
+ * @returns The text with control characters escaped as `\xNN` and URLs linked.
  */
 export function displayText(text: string): string {
-  return text.replace(TERMINAL_CONTROL_PATTERN, control =>
-    `\\x${control.charCodeAt(0).toString(16).padStart(2, '0')}`)
+  return text
+    .replace(TERMINAL_CONTROL_PATTERN, control =>
+      `\\x${control.charCodeAt(0).toString(16).padStart(2, '0')}`)
+    .replace(BARE_URL_PATTERN, match => {
+      let end = match.length
+      while (end > 0 && TRAILING_URL_PUNCTUATION.includes(match[end - 1] ?? '')) end -= 1
+      const url = match.slice(0, end)
+      const trailing = match.slice(end)
+      return `${hyperlink(url, url)}${trailing}`
+    })
 }
 
 /**

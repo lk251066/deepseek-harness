@@ -69,7 +69,9 @@ import type {
   TuiTheme,
 } from './extension/types.ts'
 import { displayInlineText, displayText } from './components/text.ts'
+import { createCodeHighlighter } from './components/highlight.ts'
 import { brandText, createPalette, markdownTheme, renderPalette, selectTheme } from './components/theme.ts'
+import { THEME_PRESETS, THEME_PRESET_NAMES, type ThemePreset } from './components/theme-presets.ts'
 import { contentText, parseArguments } from './components/content.ts'
 import {
   cacheHitRate,
@@ -89,6 +91,8 @@ import {
   STATUS_FADE_MS,
   StepTimingTracker,
   TIMING_BUCKET_GLYPHS,
+  TOOL_SPINNER_FRAMES,
+  TOOL_SPINNER_INTERVAL_MS,
   type StepPosition,
 } from './chat/timing.ts'
 import {
@@ -106,6 +110,7 @@ import {
 } from './components/transcript.ts'
 import {
   compactTargetLabel,
+  contextMeter,
   DetailsDialog,
   diagnosticMeter,
   formatDiagnosticCount,
@@ -115,6 +120,7 @@ import {
   StatusCardComponent,
   PromptContextComponent,
   targetLabel,
+  ThemeDialog,
   type DetailsSelection,
   type StatusCardRow,
 } from './components/dialogs.ts'
@@ -329,8 +335,21 @@ export function createTuiChat(
   const agent = ctx.agents.get(sessionId)
   if (agent === undefined) throw new Error(`ui-tui: session "${sessionId}" is not running`)
   const resolved = resolveTuiConfig(config)
-  const palette = createPalette(resolved.theme.color)
-  const mdTheme = markdownTheme(palette)
+  // Named-theme state: `undefined` is the adaptive `deepseek` default.
+  const initialPreset = resolved.theme.name === 'deepseek' ? undefined : THEME_PRESETS[resolved.theme.name]
+  let currentPreset: ThemePreset | undefined = initialPreset
+  let currentThemeName = initialPreset === undefined ? 'deepseek' : resolved.theme.name
+  const paletteOptions = (): { preset?: ThemePreset, truecolor?: boolean } => currentPreset === undefined
+    ? {}
+    : { preset: currentPreset, truecolor: resolved.theme.truecolor }
+  const palette = createPalette(resolved.theme.color, 'dark', paletteOptions())
+  // The highlighter reads the live palette per call; once the lazily-loaded
+  // module lands, blocks that rendered plain get a transcript rebuild.
+  const codeHighlighter = createCodeHighlighter(palette, resolved.theme.color, () => {
+    if (!disposed) rebuildTranscript(false)
+  })
+  const mdTheme = markdownTheme(palette, codeHighlighter.highlightCode)
+  codeHighlighter.preload()
   const ui = new TUI(runtime.terminal, resolved.showHardwareCursor)
   const chat = new Container()
   const todoContainer = new Container()
@@ -437,6 +456,29 @@ export function createTuiChat(
     || contextValue === undefined || queuedValue === undefined || symbolValue === undefined || indicatorValue === undefined) {
     throw new Error('TUI prompt built-ins failed to initialize')
   }
+  /**
+   * The context-pressure projection when the projection registry is mounted
+   * (the base bundle always mounts it): projected next-request tokens over the
+   * route's context window. Absent, callers fall back to the token-meter
+   * measure the footer already uses.
+   */
+  const contextPressure = (): { projectedTokens?: number, pressureTokens?: number, contextWindow?: number } | undefined => {
+    const projections = ctx.get('sessionProjections')
+    if (projections === undefined) return undefined
+    try {
+      const snapshot = (projections as {
+        snapshot?: (session: unknown) => { values?: Record<string, unknown> } | undefined
+      }).snapshot?.(agent.session)
+      const pressure = snapshot?.values?.contextPressure
+      return pressure === undefined ? undefined : pressure as {
+        projectedTokens?: number, pressureTokens?: number, contextWindow?: number
+      }
+    } catch {
+      // An unavailable projection never breaks the prompt footer.
+      return undefined
+    }
+  }
+
   const updatePromptValues = (): void => {
     const renderTime = now()
     cwdValue.set(palette.bold(palette.accent(formattedCwd)))
@@ -445,9 +487,15 @@ export function createTuiChat(
     const usage = `↑${formatTokens(tokens.input)} ↓${formatTokens(tokens.output)}`
     modelValue.set(`  ${palette.dim(displayText(target.current === undefined ? 'model unset' : compactTargetLabel(target.current)))}`)
     tokenValue.set(`  ${palette.dim(rate === undefined ? usage : `${usage}  cache ${rate}%`)}`)
-    const contextWindow = modelController.contextWindow()
-    contextValue.set(contextWindow === undefined ? undefined : `  ${palette.dim(
-      `${Math.min(100, Math.round(ctx.tokenMeter.measure(agent.session).totalTokens / contextWindow * 100))}% context`,
+    const pressure = contextPressure()
+    const usedTokens = pressure?.projectedTokens ?? pressure?.pressureTokens
+      ?? ctx.tokenMeter.measure(agent.session).totalTokens
+    const effectiveWindow = pressure?.contextWindow ?? modelController.contextWindow()
+    const occupancy = effectiveWindow === undefined || effectiveWindow <= 0
+      ? undefined
+      : Math.min(100, usedTokens / effectiveWindow * 100)
+    contextValue.set(occupancy === undefined ? undefined : `  ${palette.dim(
+      `${contextMeter(occupancy, palette)} ${Math.round(occupancy)}% context`,
     )}`)
     const queued = runningStatus === undefined ? undefined : formatQueuedStatus(pendingSteering.size)
     queuedValue.set(queued === undefined ? undefined : palette.dim(queued))
@@ -687,12 +735,27 @@ export function createTuiChat(
       resolved.maxDiffEditLength,
       palette,
       mdTheme,
+      event.time,
     )
     card.setVisibility(toolsVisibility)
     toolCards.set(event.data.callId, card)
     allToolCards.add(card)
     return card
   }
+
+  // One process-wide spinner tick: the newest pending tool card animates its
+  // braille frame. Self-gating — the tick does nothing while no card pends.
+  let spinnerFrame = 0
+  const spinnerTimer = setInterval(() => {
+    if (disposed) return
+    let pending: ToolCardComponent | undefined
+    for (const card of allToolCards) {
+      if (card.isPending()) pending = card
+    }
+    if (pending === undefined) return
+    pending.setSpinner(TOOL_SPINNER_FRAMES[spinnerFrame++ % TOOL_SPINNER_FRAMES.length] ?? TOOL_SPINNER_FRAMES[0])
+    requestRender()
+  }, TOOL_SPINNER_INTERVAL_MS)
 
   /**
    * Re-derive hidden-mode folding for one turn: the first step with a visible
@@ -878,12 +941,13 @@ export function createTuiChat(
             resolved.maxDiffEditLength,
             palette,
             mdTheme,
+            event.time,
           )
           card.setVisibility(toolsVisibility)
           chat.addChild(card)
           allToolCards.add(card)
         }
-        card.updateResult(event.data)
+        card.updateResult(event.data, event.time)
         toolCards.delete(callId)
         trailStreamingTiming()
         break
@@ -1024,6 +1088,7 @@ export function createTuiChat(
       overlayManager.beginShutdown()
       modelController.resetContextResolution()
       clearStatus()
+      clearInterval(spinnerTimer)
       for (const controller of commandControllers) controller.abort(new Error('TUI disposed'))
       commandControllers.clear()
       for (const controller of referenceControllers) controller.abort(new Error('TUI disposed'))
@@ -1060,8 +1125,10 @@ export function createTuiChat(
   const applyColorScheme = (scheme: TerminalColorScheme): void => {
     if (scheme === currentScheme) return
     currentScheme = scheme
-    Object.assign(palette, createPalette(resolved.theme.color, scheme))
-    Object.assign(mdTheme, markdownTheme(palette))
+    Object.assign(palette, createPalette(resolved.theme.color, scheme, paletteOptions()))
+    Object.assign(mdTheme, markdownTheme(palette, codeHighlighter.highlightCode))
+    // Rows cached under the prior palette's roles must not outlive it.
+    codeHighlighter.invalidate()
     // `setStatus` below re-derives `editor.borderColor` from the new palette.
     rebuildTranscript(false)
     setStatus(agent.status)
@@ -1143,6 +1210,53 @@ export function createTuiChat(
     requestRender()
   }
 
+  /**
+   * Swap the active named theme in place: rebuild the palette and derived
+   * themes over the SAME palette object (the whole component tree holds it),
+   * invalidate highlight rows cached under the old roles, and re-render.
+   */
+  const applyTheme = (name: string): boolean => {
+    const preset = THEME_PRESETS[name]
+    if (preset === undefined) {
+      appendNotice(`Unknown theme "${name}". Available: ${THEME_PRESET_NAMES.join(', ')}.`, 'warning')
+      return false
+    }
+    currentPreset = name === 'deepseek' ? undefined : preset
+    currentThemeName = name
+    Object.assign(palette, createPalette(resolved.theme.color, currentScheme, paletteOptions()))
+    Object.assign(mdTheme, markdownTheme(palette, codeHighlighter.highlightCode))
+    codeHighlighter.invalidate()
+    rebuildTranscript(false)
+    setStatus(agent.status)
+    requestRender()
+    return true
+  }
+
+  // The `/theme` picker overlay; Tab previews live, Enter keeps, Esc restores.
+  let themeOverlay: TuiOverlaySession | undefined
+  const showThemeSelector = (): void => {
+    void themeOverlay?.close()
+    const session = overlayManager.open({
+      create: () => new ThemeDialog(
+        THEME_PRESET_NAMES.map(name => ({
+          name,
+          description: THEME_PRESETS[name]?.description ?? '',
+          dark: THEME_PRESETS[name]?.dark ?? false,
+        })),
+        currentThemeName,
+        palette,
+        applyTheme,
+        () => { void session.close() },
+      ),
+      options: { width: resolved.detailsDialogWidth, anchor: 'center', margin: 1 },
+    })
+    themeOverlay = session
+    void session.closed.then(() => {
+      if (themeOverlay === session) themeOverlay = undefined
+    })
+    requestRender()
+  }
+
   // `/details` names the same transcript-detail state the Ctrl+O cycle and
   // Ctrl+R toggle mutate, so a user can jump to a mode without cycling.
   const runDetails = (rawInput: string): CommandResult => {
@@ -1195,7 +1309,7 @@ export function createTuiChat(
   const showPalette = (): void => {
     chat.addChild(new Spacer(1))
     chat.addChild(new Text(
-      renderPalette(palette, currentScheme, resolved.theme.color).join('\n'), 0, 0,
+      renderPalette(palette, currentScheme, resolved.theme.color, paletteOptions()).join('\n'), 0, 0,
     ))
     requestRender()
   }
@@ -1209,10 +1323,13 @@ export function createTuiChat(
     const registeredTools = assembly.tools.map(tool => displayText(tool.name)).join(', ') || '(none)'
     const events = agent.session.events
     const latestActivity = agent.session.header.createdAt
-    const usedContext = Math.max(0, Math.round(ctx.tokenMeter.measure(agent.session).totalTokens))
+    const pressure = contextPressure()
+    const usedContext = Math.max(0, Math.round(
+      pressure?.projectedTokens ?? pressure?.pressureTokens ?? ctx.tokenMeter.measure(agent.session).totalTokens,
+    ))
     let context = `${formatDiagnosticNumber(usedContext)} used · capacity unknown`
-    const contextWindow = modelController.contextWindow()
-    if (contextWindow !== undefined) {
+    const contextWindow = pressure?.contextWindow ?? modelController.contextWindow()
+    if (contextWindow !== undefined && contextWindow > 0) {
       const contextPercent = Math.round(usedContext / contextWindow * 100)
       context = `${diagnosticMeter(contextPercent, palette)} ${String(contextPercent)}% used (${formatDiagnosticNumber(usedContext)} / ${formatDiagnosticNumber(contextWindow)})`
     }
@@ -1369,6 +1486,20 @@ export function createTuiChat(
       name: 'palette',
       description: 'Show every color and attribute role this terminal renders',
       handler: () => { showPalette(); return { kind: 'success' } },
+    })
+    commandCtx.commands.register({
+      name: 'theme',
+      description: 'Show or switch the TUI color theme',
+      input: { hint: '[name]' },
+      handler: ({ rawInput }) => {
+        const name = rawInput.trim()
+        if (name === '') {
+          showThemeSelector()
+        } else {
+          applyTheme(name)
+        }
+        return { kind: 'success' }
+      },
     })
     commandCtx.commands.register({
       name: 'reload',
@@ -1806,6 +1937,7 @@ export function createTuiChat(
       },
     )
     clearStatus()
+    clearInterval(spinnerTimer)
     questions.unregister()
     ui.stop()
     throw error
@@ -1821,6 +1953,12 @@ export function createTuiChat(
   // session, so there is no prior turn to collide with; invokeSkill reports an
   // unknown skill as a notice.
   if (config.initialSkill !== undefined) invokeSkill(config.initialSkill, '')
+
+  // A configured theme name that matches no shipped preset falls back to the
+  // adaptive default; say so once at startup rather than failing silently.
+  if (resolved.theme.name !== 'deepseek' && THEME_PRESETS[resolved.theme.name] === undefined) {
+    appendNotice(`Unknown theme "${resolved.theme.name}" in config; using the adaptive default. Available: ${THEME_PRESET_NAMES.join(', ')}.`, 'warning')
+  }
 
   return {
     async dispose(): Promise<void> {

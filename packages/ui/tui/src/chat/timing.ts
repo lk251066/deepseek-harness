@@ -18,6 +18,18 @@ import type { Palette } from '../components/theme.ts'
 export const STATUS_ANIMATION_INTERVAL_MS = 50
 
 /**
+ * Braille frames cycling on the newest pending tool card's marker, the
+ * Claude-Code-style running animation (`⠋ Reading src/foo.ts`).
+ */
+export const TOOL_SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
+
+/**
+ * Spinner tick rate. Ten frames at 100 ms read as one smooth rotation; faster
+ * adds no legibility and only churns the differential renderer.
+ */
+export const TOOL_SPINNER_INTERVAL_MS = 100
+
+/**
  * Milliseconds over which the status glyph fades in when work starts and fades
  * out after it ends. The fade is an envelope over the active pulse:
  * inside it the glyph throbs (see {@link STATUS_PULSE_PERIOD_MS}).

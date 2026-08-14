@@ -10,6 +10,7 @@ import type {
   SelectListTheme,
   TerminalColorScheme,
 } from '@earendil-works/pi-tui'
+import type { PresetColor, ThemePreset } from './theme-presets.ts'
 
 /**
  * Text carrying exactly one palette color. Branded so the compiler rejects
@@ -66,6 +67,9 @@ export interface Palette {
 
 /** Names of the palette's color roles, in the order `/palette` prints them. */
 export const COLOR_ROLES = ['text', 'dim', 'accent', 'brand', 'code', 'success', 'warning', 'error'] as const
+
+/** One color role's name. */
+export type ColorRoleName = typeof COLOR_ROLES[number]
 
 /** Names of the palette's attribute roles, in the order `/palette` prints them. */
 export const ATTRIBUTE_ROLES = ['bold', 'italic', 'underline', 'strike', 'selected'] as const
@@ -141,6 +145,14 @@ function ansi(spec: RoleSpec, enabled: boolean): (text: string) => string {
   return text => `\x1b[${spec.open}m${text}\x1b[${spec.close}m`
 }
 
+/** Options steering {@link createPalette} toward a named theme preset. */
+export interface PaletteOptions {
+  /** Named preset overriding color roles; absent keeps the adaptive 16-color spec. */
+  preset?: ThemePreset
+  /** Whether 24-bit SGR may be emitted, painting preset roles as `38;2;r;g;b`. */
+  truecolor?: boolean
+}
+
 /**
  * Theme-agnostic palette derived from {@link paletteSpec}. Body `text` stays the
  * terminal's default foreground so it reads on light and dark backgrounds alike;
@@ -150,14 +162,43 @@ function ansi(spec: RoleSpec, enabled: boolean): (text: string) => string {
  *
  * @param enabled - Whether ANSI is emitted at all.
  * @param scheme - Active terminal color scheme; adjusts the code role.
+ * @param options - Optional named-preset overrides (`/theme`).
  * @returns The role palette for the given scheme.
  */
-export function createPalette(enabled: boolean, scheme: TerminalColorScheme = 'dark'): Palette {
-  const spec = paletteSpec(scheme)
+export function createPalette(
+  enabled: boolean,
+  scheme: TerminalColorScheme = 'dark',
+  options: PaletteOptions = {},
+): Palette {
+  const spec = resolveSpec(scheme, options)
   const roles = {} as Record<string, unknown>
   for (const name of COLOR_ROLES) roles[name] = ansi(spec.colors[name], enabled)
   for (const name of ATTRIBUTE_ROLES) roles[name] = ansi(spec.attributes[name], enabled)
   return roles as unknown as Palette
+}
+
+/**
+ * The role spec for one scheme with optional preset overrides applied — the
+ * single resolution path shared by {@link createPalette} and `/palette`.
+ */
+function resolveSpec(scheme: TerminalColorScheme, options: PaletteOptions): ReturnType<typeof paletteSpec> {
+  const base = paletteSpec(scheme)
+  const { preset, truecolor } = options
+  if (preset === undefined) return base
+  const colors = { ...base.colors } as Record<ColorRoleName, RoleSpec>
+  for (const [role, color] of Object.entries(preset.colors) as [ColorRoleName, PresetColor][]) {
+    const attribute = color.truecolorAttribute
+    colors[role] = {
+      open: truecolor === true
+        ? `${attribute === undefined ? '' : `${attribute.open};`}38;2;${color.rgb[0]};${color.rgb[1]};${color.rgb[2]}`
+        : color.ansi16,
+      // The default closes only the foreground group; attribute-bearing roles
+      // (the dim's faint) reset both groups so the attribute never bleeds.
+      close: color.close ?? (attribute === undefined ? '39' : `${attribute.close};39`),
+      purpose: `${base.colors[role].purpose} (themed)`,
+    }
+  }
+  return { ...base, colors }
 }
 
 /**
@@ -229,9 +270,11 @@ export function gradientText(text: string): string {
 /**
  * Derive the pi-tui Markdown theme from a role palette.
  * @param palette - Active role palette.
+ * @param highlightCode - Optional syntax highlighter for fenced code blocks;
+ * absent renders every code row through the single `codeBlock` role.
  * @returns The Markdown theme wired to palette roles.
  */
-export function markdownTheme(palette: Palette): MarkdownTheme {
+export function markdownTheme(palette: Palette, highlightCode?: (code: string, lang?: string) => string[]): MarkdownTheme {
   return {
     heading: text => palette.accent(text),
     link: text => palette.accent(text),
@@ -240,6 +283,7 @@ export function markdownTheme(palette: Palette): MarkdownTheme {
     linkUrl: text => palette.dim(text),
     code: text => palette.code(text),
     codeBlock: text => palette.code(text),
+    ...(highlightCode !== undefined ? { highlightCode } : {}),
     // pi-tui presents both fence rows through this callback. Keep the opening
     // language label, but hide Markdown syntax and the otherwise-empty close.
     codeBlockBorder: text => palette.dim(text.slice(3)),
@@ -294,14 +338,17 @@ const PALETTE_SAMPLE = 'The quick brown fox 0123'
  * @param palette - Active role palette, used to paint each sample.
  * @param scheme - Active color scheme, reported in the heading and selecting the spec.
  * @param colorEnabled - Whether ANSI is emitted; reported so an unstyled listing is not confusing.
+ * @param options - The same preset options the palette was built with, so the
+ * printed SGR pairs match the live roles.
  * @returns The rendered rows, without a trailing blank.
  */
 export function renderPalette(
   palette: Palette,
   scheme: TerminalColorScheme,
   colorEnabled: boolean,
+  options: PaletteOptions = {},
 ): string[] {
-  const spec = paletteSpec(scheme)
+  const spec = resolveSpec(scheme, options)
   const width = Math.max(...[...COLOR_ROLES, ...ATTRIBUTE_ROLES].map(name => name.length))
   // Two rows per role: the painted sample beside its name and SGR pair, then the
   // purpose indented under it. Splitting the purpose onto its own row keeps every

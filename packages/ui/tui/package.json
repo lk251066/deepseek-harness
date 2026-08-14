@@ -32,14 +32,15 @@
   ],
   "license": "BSD-3-Clause",
   "peerDependencies": {
+    "@deepseek-ai/cordis": "workspace:^",
     "@deepseek-ai/dsh-agent": "workspace:^",
     "@deepseek-ai/dsh-agent-loop": "workspace:^",
     "@deepseek-ai/dsh-commands": "workspace:^",
     "@deepseek-ai/dsh-compaction": "workspace:^",
+    "@deepseek-ai/dsh-goal": "workspace:^",
     "@deepseek-ai/dsh-invariants": "workspace:^",
     "@deepseek-ai/dsh-llm": "workspace:^",
     "@deepseek-ai/dsh-llm-retry": "workspace:^",
-    "@deepseek-ai/dsh-goal": "workspace:^",
     "@deepseek-ai/dsh-session": "workspace:^",
     "@deepseek-ai/dsh-session-persistence": "workspace:^",
     "@deepseek-ai/dsh-session-projection": "workspace:^",
@@ -52,8 +53,7 @@
     "@deepseek-ai/dsh-system-prompt": "workspace:^",
     "@deepseek-ai/dsh-token-meter": "workspace:^",
     "@deepseek-ai/dsh-tools": "workspace:^",
-    "@deepseek-ai/dsh-user-questions": "workspace:^",
-    "@deepseek-ai/cordis": "workspace:^"
+    "@deepseek-ai/dsh-user-questions": "workspace:^"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-session-persistence": {
@@ -68,17 +68,19 @@
   },
   "dependencies": {
     "@earendil-works/pi-tui": "0.80.7",
+    "cli-highlight": "^2.1.11",
     "diff": "^9.0.0",
     "saxes": "6.0.0",
     "schemastery": "^3.18.0"
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "workspace:^",
     "@deepseek-ai/cordis-plugin-loader": "workspace:^",
     "@deepseek-ai/dsh-agent": "workspace:^",
     "@deepseek-ai/dsh-agent-loop": "workspace:^",
-    "@deepseek-ai/dsh-goal": "workspace:^",
     "@deepseek-ai/dsh-commands": "workspace:^",
     "@deepseek-ai/dsh-compaction": "workspace:^",
+    "@deepseek-ai/dsh-goal": "workspace:^",
     "@deepseek-ai/dsh-invariants": "workspace:^",
     "@deepseek-ai/dsh-llm": "workspace:^",
     "@deepseek-ai/dsh-llm-retry": "workspace:^",
@@ -98,7 +100,6 @@
     "@deepseek-ai/dsh-tools": "workspace:^",
     "@deepseek-ai/dsh-user-questions": "workspace:^",
     "@deepseek-ai/dsh-workflow": "workspace:^",
-    "@xterm/headless": "5.5.0",
-    "@deepseek-ai/cordis": "workspace:^"
+    "@xterm/headless": "5.5.0"
   }
 }

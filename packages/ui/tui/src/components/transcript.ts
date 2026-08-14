@@ -30,8 +30,10 @@ import { preview, renderUnknownXml } from './xml-tool-output.ts'
 import { displayInlineText, displayText } from './text.ts'
 import { gradientText, type Palette } from './theme.ts'
 import { contentText, type ParsedArguments } from './content.ts'
+import { progressiveTitle, settledTitle } from '../chat/tool-verbs.ts'
 import {
   formatCompletionTime,
+  formatStatusDuration,
   formatTimingTotals,
   type StepPosition,
   type StepTimingTracker,
@@ -76,10 +78,16 @@ function diffContentLines(text: string): string[] {
  * change totals. Comparisons beyond the edit-distance budget fall back to
  * whole-side rendering so a model-authored pending edit cannot stall the TUI.
  */
-function renderDiff(diff: FileDiff, maxDiffEditLength: number, palette: Palette): RenderedDiff {
-  // The card header is a fixed `Tool / <name>` frame that never names a file, so
-  // each hunk always carries its own path header (no redundancy to suppress).
-  const lines = [palette.bold(displayText(diff.path))]
+function renderDiff(
+  diff: FileDiff,
+  maxDiffEditLength: number,
+  palette: Palette,
+  skipPathHeader = false,
+): RenderedDiff {
+  // The card header names the call (settled verb title); a single-file diff
+  // whose title already carries the path skips the body's path header, while a
+  // multi-file diff keeps one path header per file.
+  const lines = skipPathHeader ? [] : [palette.bold(displayText(diff.path))]
   let added = 0
   let removed = 0
   if (diff.oldText === null) {
@@ -411,6 +419,27 @@ interface CardBody {
  */
 export type ToolCardVisibility = 'hidden' | 'collapsed' | 'expanded'
 
+/** Marker column prefixing a card's first result row (the Claude Code `⎿`). */
+const RESULT_MARKER = '  ⎿ '
+/** Indent aligning continuation rows under the marker's text column. */
+const RESULT_CONTINUATION = '    '
+
+/**
+ * Prefix a card's body rows with the result marker: the first non-blank row
+ * carries `⎿`, later rows align under its text column, blank rows stay empty.
+ */
+function prefixResultLines(body: readonly string[]): string[] {
+  let marked = false
+  return body.map(line => {
+    if (line === '') return ''
+    if (!marked) {
+      marked = true
+      return `${RESULT_MARKER}${line}`
+    }
+    return `${RESULT_CONTINUATION}${line}`
+  })
+}
+
 /**
  * Transcript card with a width-keyed rendered-row cache. pi-tui re-renders
  * every component each frame and relies on per-component line caches (its own
@@ -453,6 +482,8 @@ export class ToolCardComponent extends CachedCardComponent {
   private callView: ToolCallView
   private resultView: ToolResultView | undefined
   private diffBodyCache: { view: ToolCallView | ToolResultView; body: CardBody } | undefined
+  private endedAt: number | undefined
+  private spinnerFrame: string | undefined
 
   constructor(
     private readonly name: string,
@@ -462,9 +493,27 @@ export class ToolCardComponent extends CachedCardComponent {
     private readonly maxDiffEditLength: number,
     private readonly palette: Palette,
     private readonly mdTheme: MarkdownTheme,
+    /** Wall-clock time of the `tool/call` event, for the settled duration. */
+    private readonly startedAt: number | undefined = undefined,
   ) {
     super()
     this.callView = this.presentCall()
+  }
+
+  /** Whether the call is still awaiting its result. */
+  isPending(): boolean {
+    return this.result === undefined
+  }
+
+  /**
+   * Show `frame` in place of the pending glyph (the braille spinner); one
+   * frame per animation tick while the newest pending card animates.
+   * @param frame - The spinner frame glyph, or `undefined` for the hollow dot.
+   */
+  setSpinner(frame: string | undefined): void {
+    if (this.spinnerFrame === frame) return
+    this.spinnerFrame = frame
+    this.dropLines()
   }
 
   private presentCall(): ToolCallView {
@@ -482,9 +531,12 @@ export class ToolCardComponent extends CachedCardComponent {
   /**
    * Record the tool result and derive its result view.
    * @param event - The `tool/result` event payload.
+   * @param endedAt - Wall-clock time of the `tool/result` event.
    */
-  updateResult(event: Extract<SessionEvent, { type: 'tool/result' }>['data']): void {
+  updateResult(event: Extract<SessionEvent, { type: 'tool/result' }>['data'], endedAt?: number): void {
     this.diffBodyCache = undefined
+    this.endedAt = endedAt
+    this.spinnerFrame = undefined
     this.dropLines()
     const result = event.message.content[0]
     this.result = {
@@ -516,9 +568,11 @@ export class ToolCardComponent extends CachedCardComponent {
     // keeps only the conversation, the way Codex hides tool calls.
     if (this.visibility === 'hidden') return []
     const isError = this.result?.isError ?? false
-    // A ring marker: hollow while the call is pending, filled once it settles;
-    // the header color (warning/success/error) tells pending from ok from error.
-    const glyph = this.result === undefined ? '○' : '●'
+    // Claude-Code-style marker: the braille spinner frame while pending (the
+    // hollow dot before the first tick or in a replayed log), the filled ⏺
+    // once settled; the header color (warning/success/error) doubles the state.
+    const pending = this.result === undefined
+    const glyph = pending ? this.spinnerFrame ?? '○' : '⏺'
     const rawBody = this.renderBody()
     const view = this.resultView ?? this.callView
     // A generic card's own content, a read card's `content` fallback (the
@@ -562,26 +616,31 @@ export class ToolCardComponent extends CachedCardComponent {
     const visibleBody = unknownXml !== undefined || this.visibility === 'expanded'
       ? body
       : preview(body, this.maxOutputLines, count => this.palette.dim(`… +${count} lines (Ctrl+O to expand)`))
-    // The header is a fixed `Tool / <name>` frame in the status color (warning
-    // pending / success ok / error), flat — no bold or underline, so one color
-    // reads consistently across the whole row. Every tool-specific detail (a
-    // read's path, a diff, command output) lives in the body below; the sole
-    // header extra is a bash card's model-authored description, appended as a
-    // `/ <desc>` segment. The body stays unprefixed so a drag-select copies only
-    // the tool text; body lines pass through Text so overlong output wraps.
-    const statusColor = this.result === undefined
+    // The header is one card row in the status color (warning pending /
+    // success ok / error): the marker glyph, a verb title naming what THIS call
+    // does (progressive while pending, the presenter's settled label once
+    // resolved), and the wall-clock duration once settled. Body rows sit under
+    // a `⎿` continuation marker so the output reads as the call's result.
+    const statusColor = pending
       ? this.palette.warning
       : isError ? this.palette.error : this.palette.success
-    // The header is a single card row: collapse an embedded newline in the
-    // description to an inline escape so it cannot break onto extra rows and
-    // collide with the body lines that follow.
-    const desc = this.headerDescription()
-    const headerText = `${glyph} Tool / ${displayText(this.name)}${desc === undefined ? '' : ` / ${displayInlineText(desc)}`}`
+    const label = pending
+      ? progressiveTitle(this.name, this.callView)
+      : settledTitle(this.name, this.mergedView())
+    const duration = pending || this.startedAt === undefined || this.endedAt === undefined
+      ? ''
+      : ` · ${formatStatusDuration(Math.max(0, this.endedAt - this.startedAt))}`
+    // The header is a single card row: collapse an embedded newline in a
+    // model-authored label to an inline escape so it cannot break onto extra
+    // rows and collide with the body lines that follow.
+    const headerText = `${glyph} ${displayInlineText(label)}${duration}`
     const header = truncateToWidth(headerText, Math.max(1, width - 2), '')
     // The blank first row is the card's own paragraph gap (no external Spacer),
     // so the hidden state removes the gap together with the card.
     const lines: string[] = ['', statusColor(header)]
-    if (visibleBody.length > 0) lines.push(...new Text(visibleBody.join('\n'), 0, 0).render(width))
+    if (visibleBody.length > 0) {
+      lines.push(...new Text(prefixResultLines(visibleBody).join('\n'), 0, 0).render(width))
+    }
     return lines
   }
 
@@ -591,22 +650,22 @@ export class ToolCardComponent extends CachedCardComponent {
   }
 
   /**
-   * The optional header `/ <desc>` segment: a bash (terminal) card's
-   * model-authored description. Non-terminal tools contribute no header detail —
-   * their presenter title moves into the body instead.
+   * The settled label's view: the result view with its omitted fields falling
+   * back to the call view's (a result view that replaces no title keeps the
+   * pending one — e.g. a terminal result carries the output but not the
+   * command, which lives in the call view's title).
    */
-  private headerDescription(): string | undefined {
-    const description = this.terminalPending()?.description
-    return description !== undefined && description !== '' ? description : undefined
-  }
-
-  /**
-   * The presenter's title for a non-terminal card, shown as the first body line
-   * (a read's `Read src/foo.ts`, a diff's `Edit files`) now that the header is a
-   * fixed `Tool / <name>` frame. The result-state title replaces the pending one.
-   */
-  private bodyTitle(): string {
-    return this.resultView?.title ?? this.callView.title
+  private mergedView(): { card: string, title?: string, description?: string } {
+    const call = this.callView as { card: string, title?: string, description?: string }
+    if (this.resultView === undefined) return call
+    const result = this.resultView as { card: string, title?: string, description?: string }
+    const title = result.title ?? call.title
+    const description = result.description ?? call.description
+    return {
+      card: result.card,
+      ...title !== undefined ? { title } : {},
+      ...description !== undefined ? { description } : {},
+    }
   }
 
   private renderBody(): CardBody {
@@ -639,11 +698,15 @@ export class ToolCardComponent extends CachedCardComponent {
     }
     if (view.card === 'diff') {
       if (this.diffBodyCache?.view === view) return this.diffBodyCache.body
-      // The header no longer names the file, so each diff keeps its own path
-      // header. A trailing footer summarizes the exact changed rows when the
-      // bounded comparison succeeds (`+A -R · N file(s)`).
+      // A single-file diff whose title already names the file keeps the path
+      // out of the body; multi-file diffs (or a title-less view) keep one path
+      // header per file. A trailing footer summarizes the exact changed rows
+      // when the bounded comparison succeeds (`+A -R · N file(s)`).
+      const first = view.diffs[0]
+      const skipPath = view.diffs.length === 1 && first !== undefined
+        && view.title !== undefined && view.title.includes(first.path)
       const renderedDiffs = view.diffs.map(diff =>
-        renderDiff(diff, this.maxDiffEditLength, this.palette),
+        renderDiff(diff, this.maxDiffEditLength, this.palette, skipPath),
       )
       const added = renderedDiffs.reduce((total, rendered) => total + rendered.added, 0)
       const removed = renderedDiffs.reduce((total, rendered) => total + rendered.removed, 0)
@@ -665,17 +728,12 @@ export class ToolCardComponent extends CachedCardComponent {
     // search or web card carries no `content` copy and falls back to the raw
     // result content here. (Mirrors the `markdownContent` selection in render();
     // a read card has no dedicated TUI rendering, so its `content` takes the same
-    // body path, keeping read output as it was before the read card existed, and
-    // a search card stays byte-identical to the pre-search-card fallback.)
+    // body path, and a search card stays byte-identical to the generic fallback.)
+    // The presenter title headlines the HEADER (progressive/settled verb title),
+    // so the body carries only the output itself.
     const content = (view.card === 'generic' || view.card === 'read' ? view.content : undefined) ?? this.result?.content
     const prelude: string[] = []
     const lines: string[] = []
-    // The presenter title headlines the body now that the header is a fixed
-    // `Tool / <name>` frame (a terminal card keeps its command $-line instead).
-    // Skip it when it only repeats the tool name (the fallback presenter for a
-    // tool with no presentCall, or an unknown tool), which the header already shows.
-    const bodyTitle = this.bodyTitle()
-    if (bodyTitle !== displayText(this.name)) prelude.push(displayInlineText(bodyTitle))
     if (content !== undefined) lines.push(...displayText(contentText(content)).split('\n'))
     const rawInput = this.result === undefined && this.callView.card === 'generic'
       ? this.callView.rawInput

@@ -170,6 +170,20 @@ export function diagnosticMeter(percent: number, palette: Palette): string {
   return `${palette.dim('[')}${palette.accent('█'.repeat(filled))}${palette.dim(`${'░'.repeat(width - filled)}]`)}`
 }
 
+/**
+ * Compact 10-cell context-occupancy bar for the prompt row: fill colored by
+ * pressure (dim below 60%, warning to 85%, error above), remainder recessed.
+ */
+export function contextMeter(percent: number, palette: Palette): string {
+  const width = 10
+  const clamped = Math.min(100, Math.max(0, percent))
+  const filled = Math.round(clamped / 100 * width)
+  const color = clamped >= 85 ? palette.error : clamped >= 60 ? palette.warning : palette.dim
+  // An empty fill renders no escape pair at all (an empty-colored span is an
+  // empty dim pair, which downstream consumers treat as a leak).
+  return `${filled > 0 ? color('█'.repeat(filled)) : ''}${palette.dim('░'.repeat(width - filled))}`
+}
+
 /** One `label: value` row of a status card group. */
 export type StatusCardRow = readonly [label: string, value: string]
 
@@ -496,6 +510,82 @@ export class DetailsDialog implements Component {
       ...this.list.render(innerWidth),
       '',
       this.palette.dim('↑/↓ move • Tab toggle • Enter/Esc close'),
+    ], width, this.palette)
+  }
+}
+
+/** One `/theme` picker row. */
+export interface ThemeChoice {
+  name: string
+  description: string
+  dark: boolean
+}
+
+/**
+ * The `/theme` picker: a bordered select list over the shipped presets. Tab
+ * applies the highlighted theme immediately as a live preview behind the
+ * dialog; Enter keeps it and closes; Esc/Ctrl+C restores the entry theme.
+ */
+export class ThemeDialog implements Component {
+  private readonly list: SelectList
+  private readonly entry: string
+
+  constructor(
+    choices: readonly ThemeChoice[],
+    current: string,
+    private readonly palette: Palette,
+    private readonly apply: (name: string) => void,
+    private readonly close: () => void,
+  ) {
+    this.entry = current
+    const items: SelectItem[] = choices.map(choice => ({
+      value: choice.name,
+      label: displayText(choice.name),
+      description: [
+        displayText(choice.description),
+        choice.dark ? 'dark bg' : 'any bg',
+        ...choice.name === current ? ['current'] : [],
+      ].join(' — '),
+    }))
+    this.list = new SelectList(items, Math.max(1, choices.length), dialogSelectTheme(palette))
+    const index = items.findIndex(item => item.value === current)
+    this.list.setSelectedIndex(Math.max(0, index))
+    this.list.onSelect = item => {
+      this.apply(item.value)
+      this.close()
+    }
+    this.list.onCancel = this.restore
+  }
+
+  /** Re-apply the theme active when the dialog opened, then close. */
+  private restore = (): void => {
+    this.apply(this.entry)
+    this.close()
+  }
+
+  invalidate(): void {
+    this.list.invalidate()
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl('c'))) {
+      this.restore()
+    } else if (matchesKey(data, Key.tab)) {
+      // Tab previews: apply the highlighted theme without closing.
+      const selected = this.list.getSelectedItem()
+      if (selected !== null) this.apply(selected.value)
+    } else {
+      this.list.handleInput(data)
+    }
+    this.invalidate()
+  }
+
+  render(width: number): string[] {
+    const innerWidth = Math.max(1, width - 4)
+    return renderDialog('Theme', [
+      ...this.list.render(innerWidth),
+      '',
+      this.palette.dim('↑/↓ move • Tab preview • Enter keep • Esc restore'),
     ], width, this.palette)
   }
 }

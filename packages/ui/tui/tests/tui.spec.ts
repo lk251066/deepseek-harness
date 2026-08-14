@@ -204,6 +204,7 @@ describe('TUI config', () => {
       theme: {
         color: true,
         truecolor: false,
+        name: 'deepseek',
         leftPrompt: '${cwd}${git/worktree}${model}${token_meter/cache_hit_rate}${context}',
         rightPrompt: '${queued}',
         inputPrompt: '${symbol} ${indicator}',
@@ -250,6 +251,7 @@ describe('TUI config', () => {
       theme: {
         color: false,
         truecolor: true,
+        name: 'deepseek',
         leftPrompt: '${cwd}${git/worktree}${model}${token_meter/cache_hit_rate}${context}',
         rightPrompt: '${queued}',
         inputPrompt: '${symbol} ${indicator}',
@@ -2767,7 +2769,9 @@ describe('pi-tui chat lifecycle and transcript', () => {
     expect(result.terminal.output).toContain('nested result')
     expect(result.terminal.output).toContain('[future-block]')
     expect(result.terminal.output).toContain('[content]')
-    expect(result.terminal.output).toContain('\x1b[36mconst answer = 42\x1b[39m')
+    // Fenced code renders through the syntax highlighter: keywords take the
+    // accent role and numbers the warning role rather than one flat code color.
+    expect(result.terminal.output).toContain('\x1b[95mconst\x1b[39m answer = \x1b[33m42\x1b[39m')
     expect(result.terminal.output).not.toContain('```')
     expect(result.terminal.output).toContain('↑2.0m ↓1.5m')
     await dispose(result)
@@ -5243,25 +5247,25 @@ describe('tool cards and surface replay', () => {
     expect(output).toContain('set\\x0aand echo')
     expect(output).toContain('lines (Ctrl+O to expand)')
     expect(output).toContain('SIGTERM')
-    // The header is a fixed `Tool / <name>` frame; the tool name shows there.
-    expect(output).toContain('Tool / bash')
-    expect(output).toContain('Tool / edit')
-    // An empty-string terminal description contributes no ` / <desc>` segment;
-    // the header ends at the tool name, and the command shows as the body $-line.
-    expect(output).toContain('Tool / emptyDescTerminal')
-    expect(output).not.toContain('Tool / emptyDescTerminal /')
+    // The header is the presenter's settled verb title behind the ⏺ marker.
+    expect(output).toContain('⏺ Run command')
+    expect(output).toContain('⏺ Edit files')
+    // An empty-string terminal description leaves the progressive
+    // Running(command) label; the command shows as the body $-line.
+    expect(output).toContain('○ Running blank desc command')
     expect(output).toContain('$ blank desc command')
     // A card whose title only repeats the name renders header-only (empty body).
-    expect(output).toContain('Tool / emptyBody')
+    expect(output).toContain('○ emptyBody')
     // A search result view carries no `content` of its own, so the card renders
     // the raw model-facing result text through the same dim generic body — the
-    // TUI has no dedicated search arm.
-    expect(output).toContain('Tool / search')
+    // TUI has no dedicated search arm. The settled label falls back to the call
+    // title (the search result view replaces none).
+    expect(output).toContain('⏺ Grep todo')
     expect(output).toContain('Line 1: todo one')
-    // A diff card drops its title (the paths + change footer carry the meaning).
-    // The first file's path is head-visible; the second file and the change
-    // footer sit past this card's 4-line budget and appear only when expanded.
-    expect(output).not.toContain('Edit files')
+    // A multi-file diff's title carries no path, so each file keeps its own
+    // path header in the body. The second file's change and the footer sit
+    // past this card's 4-line budget and appear only when expanded.
+    expect(output).toContain('Edit files')
     expect(output).toContain('a.txt')
     // A generic card's presenter title moves from the header into the body.
     expect(output).toContain('Inspected')
@@ -5323,7 +5327,7 @@ describe('tool cards and surface replay', () => {
     result.terminal.send('\x0c')
     await tick()
     const hiddenFrame = result.terminal.output.slice(result.terminal.output.lastIndexOf('\x1b[2J'))
-    expect(hiddenFrame).not.toContain('Tool / bash')
+    expect(hiddenFrame).not.toContain('⏺')
     expect(hiddenFrame).not.toContain('Run command')
     expect(hiddenFrame).not.toContain('fallback result body')
     // The dozen hidden cards leave no per-card blank rows behind: each card owns
@@ -5354,10 +5358,10 @@ describe('tool cards and surface replay', () => {
     })
     await tick()
     const output = result.terminal.output
-    // The header is a fixed `Tool / <name>` frame; the diff title is dropped and
-    // the file path shows once in the body, above the change footer.
-    expect(output).toContain('Tool / singleDiff')
-    expect(output).not.toContain('Edit src/only.ts')
+    // The pending header carries the progressive verb title; a single-file diff
+    // whose title names the file keeps the path out of the body, so the path
+    // shows exactly once (in the header).
+    expect(output).toContain('○ Editing src/only.ts')
     expect(output.split('src/only.ts').length - 1).toBe(1)
     expect(output).toContain('  my: my-MM')
     expect(output).not.toContain('- my: my-MM')

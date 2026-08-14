@@ -10,6 +10,15 @@
 
 # ── surface-specific values the base deliberately omits ─────────────────────
 
+- id: agent-loop
+  config:
+    agents:
+      - id: main
+        sessionId: main
+        provider: deepseek-official
+        model: deepseek-v4-pro
+        cwd: !!js process.cwd()
+
 - id: system-prompt
   config:
     persona: >-
@@ -56,11 +65,6 @@
       config:
         backend: json
 
-    # Terminal-multiplexer context, mounted only where a terminal exists.
-    - id: tmux-context
-      name: '@deepseek-ai/dsh-tmux-context'
-      config:
-        refreshIntervalMs: 900000
 
     # The keyboard-backed provider behind ask_user_question and the plan-mode
     # review, and the front door it renders inside.

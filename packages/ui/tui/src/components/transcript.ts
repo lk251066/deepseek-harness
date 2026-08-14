@@ -506,6 +506,16 @@ export class ToolCardComponent extends CachedCardComponent {
   }
 
   /**
+   * The card's current verb label (progressive while pending, settled after),
+   * for surfaces that name the call outside the transcript (approval dialogs).
+   */
+  label(): string {
+    return this.isPending()
+      ? progressiveTitle(this.name, this.callView)
+      : settledTitle(this.name, this.mergedView())
+  }
+
+  /**
    * Show `frame` in place of the pending glyph (the braille spinner); one
    * frame per animation tick while the newest pending card animates.
    * @param frame - The spinner frame glyph, or `undefined` for the hollow dot.

@@ -50,6 +50,9 @@ import { foldSessionTitle } from '@deepseek-ai/dsh-session-title'
 // service onto `Context` so `ctx.get('sessionPersistence')` is typed.
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type { SkillRegistry } from '@deepseek-ai/dsh-skill'
+// Merges the `permissionPresets` service and the `permission/preset` session
+// event onto their ambient declarations; the service itself is optional at runtime.
+import type {} from '@deepseek-ai/dsh-permission-presets'
 // Type import declaration-merges the `userInteraction` service onto `Context`;
 // the ask-user-question queue is registered by ./chat/questions.
 import type {} from '@deepseek-ai/dsh-user-questions'
@@ -110,6 +113,7 @@ import {
 } from './components/transcript.ts'
 import {
   compactTargetLabel,
+  ConfirmDialog,
   contextMeter,
   DetailsDialog,
   diagnosticMeter,
@@ -119,6 +123,7 @@ import {
   initialTarget,
   StatusCardComponent,
   PromptContextComponent,
+  RenameDialog,
   targetLabel,
   ThemeDialog,
   type DetailsSelection,
@@ -144,7 +149,13 @@ import {
   createModelController,
   type ModelController,
 } from './chat/model-command.ts'
+import { createApprovalAnswerer } from './chat/approval.ts'
+import { createGoalBar } from './chat/goal-bar.ts'
+import { createPermissionController } from './chat/permission.ts'
 import { createQuestionQueue } from './chat/questions.ts'
+import { createQueueDock, replaceQueuedMessage } from './chat/queue-dock.ts'
+import { forkSession } from './chat/fork.ts'
+import { foldPlanMode } from '@deepseek-ai/dsh-plan-mode'
 import { createResumeController } from './chat/resume.ts'
 import type { TuiResumeHost, TuiRuntime } from './runtime.ts'
 import { WorkspaceFileSearch } from './chat/file-autocomplete.ts'
@@ -449,11 +460,14 @@ export function createTuiChat(
     ctx.tuiPrompt.register('queued'),
     ctx.tuiPrompt.register('symbol', palette.bold(palette.accent('dsh'))),
     ctx.tuiPrompt.register('indicator', palette.dim('> ')),
+    ctx.tuiPrompt.register('permission'),
+    ctx.tuiPrompt.register('plan'),
   ]
-  const [cwdValue, gitValue, tokenValue, modelValue, contextValue, queuedValue, symbolValue, indicatorValue] = promptValues
+  const [cwdValue, gitValue, tokenValue, modelValue, contextValue, queuedValue, symbolValue, indicatorValue, permissionValue, planValue] = promptValues
   /* v8 ignore next -- the fixed built-in registration list always supplies each handle. */
   if (cwdValue === undefined || gitValue === undefined || tokenValue === undefined || modelValue === undefined
-    || contextValue === undefined || queuedValue === undefined || symbolValue === undefined || indicatorValue === undefined) {
+    || contextValue === undefined || queuedValue === undefined || symbolValue === undefined || indicatorValue === undefined
+    || permissionValue === undefined || planValue === undefined) {
     throw new Error('TUI prompt built-ins failed to initialize')
   }
   /**
@@ -499,6 +513,12 @@ export function createTuiChat(
     )}`)
     const queued = runningStatus === undefined ? undefined : formatQueuedStatus(pendingSteering.size)
     queuedValue.set(queued === undefined ? undefined : palette.dim(queued))
+    // Shift+Tab's preset ring and the plan-mode chip; absent services render nothing.
+    const preset = permissionController.chip()
+    permissionValue.set(preset === undefined || preset === 'custom' ? undefined : palette.dim(` [${preset}]`))
+    planValue.set(foldPlanMode(agent.session.events)
+      ? palette.bold(palette.accent(' ⎇ plan'))
+      : undefined)
     symbolValue.set(palette.bold(palette.accent('dsh')))
     compactionStatusLine.setText(compacting === undefined
       ? ''
@@ -548,6 +568,10 @@ export function createTuiChat(
   ui.addChild(new Spacer(1))
   todoContainer.addChild(todo)
   ui.addChild(todoContainer)
+  // Docks (goal bar, steering queue) mount into this slot in order once their
+  // controllers exist; an empty container renders nothing.
+  const docks = new Container()
+  ui.addChild(docks)
   ui.addChild(compactionStatusLine)
   ui.addChild(promptContext)
   ui.addChild(questionContainer)
@@ -648,6 +672,37 @@ export function createTuiChat(
     requestRender,
     isDisposed,
   })
+
+  // Shift+Tab preset ring with the danger-preset risk confirmation overlay.
+  const permissionController = createPermissionController({
+    ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent,
+    confirmRisk: (message, onChoice) => {
+      const session = overlayManager.open({
+        create: () => new ConfirmDialog(
+          'Full access',
+          message,
+          palette,
+          onChoice,
+          () => { void session.close() },
+        ),
+        options: { width: 64, anchor: 'center', margin: 1 },
+      })
+      requestRender()
+    },
+  })
+
+  // The goal dock (Ctrl+G actions) and the steering queue dock (/queue sheet).
+  const goalBar = createGoalBar({ ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent })
+  const queueDock = createQueueDock({
+    ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent,
+    loadIntoEditor: text => {
+      editor.setText(text)
+      requestRender()
+    },
+  })
+  docks.addChild(goalBar.component)
+  docks.addChild(queueDock.component)
+
   updatePromptValues()
 
   const renderStatus = (): void => {
@@ -702,7 +757,12 @@ export function createTuiChat(
     else if (fadeOutGlyph !== undefined) beginFadeOut(fadeOutGlyph)
     else clearTurnStatus()
     editor.borderColor = status === 'running' ? text => palette.accent(text) : text => palette.dim(text)
-    editor.hint = status === 'running' ? palette.dim(displayInlineText(resolved.theme.inputPlaceholder)) : undefined
+    // Running keeps the steering placeholder; idle plan mode carries its own.
+    editor.hint = status === 'running'
+      ? palette.dim(displayInlineText(resolved.theme.inputPlaceholder))
+      : foldPlanMode(agent.session.events)
+        ? palette.dim('plan mode — present a plan; the review runs before any edit')
+        : undefined
     if (status === 'running') {
       const turn = priorTurn ?? openTurn(agent.session.events)
       const running: RunningStatus = {
@@ -1059,6 +1119,28 @@ export function createTuiChat(
     },
   })
 
+  // The keyboard answerer behind `approval/request` — without it, a tool call
+  // the sandbox wants to ask about fails closed ("no approval channel").
+  const approvals = createApprovalAnswerer({
+    ctx,
+    resolved,
+    palette,
+    overlayManager,
+    requestRender,
+    isDisposed,
+    appendNotice,
+    agent,
+    questionMaxHeight: () => {
+      const width = runtime.terminal.columns
+      const editorRows = editor.render(width).length
+      return Math.max(1, Math.min(
+        resolved.questionDialogMaxHeight,
+        runtime.terminal.rows - editorRows,
+      ))
+    },
+    pendingCallLabel: callId => callId === undefined ? undefined : toolCards.get(callId)?.label(),
+  })
+
   const resume = createResumeController({
     ctx,
     agent,
@@ -1095,6 +1177,8 @@ export function createTuiChat(
       referenceControllers.clear()
       await tuiServiceFiber?.dispose()
       tuiServiceFiber = undefined
+      approvals.drain()
+      approvals.unregister()
       questions.rejectAll()
       await overlayManager.dispose()
       modelController.clearOverlay()
@@ -1232,6 +1316,23 @@ export function createTuiChat(
     return true
   }
 
+  /** Rename the session through the (optional) session-title service. */
+  const renameSession = (title: string): void => {
+    const titles = ctx.get('sessionTitle') as {
+      rename(session: unknown, title: string): unknown
+    } | undefined
+    if (titles === undefined) {
+      appendNotice('Session titles are not available in this session.', 'warning')
+      return
+    }
+    try {
+      titles.rename(agent.session, title)
+      appendNotice(`Session renamed to "${title}".`)
+    } catch (error) {
+      appendNotice(`Rename failed: ${errorChain(error)}`, 'error')
+    }
+  }
+
   // The `/theme` picker overlay; Tab previews live, Enter keeps, Esc restores.
   let themeOverlay: TuiOverlaySession | undefined
   const showThemeSelector = (): void => {
@@ -1298,7 +1399,7 @@ export function createTuiChat(
     chat.addChild(new Text([
       'Enter send • Shift/Alt+Enter newline • Up/Down prompt history',
       'Esc cancel turn • Ctrl+O cycle cards (collapse/expand/hide) • Ctrl+R toggle reasoning • Ctrl+L redraw',
-      'Ctrl+C cancel while running; clear input or exit while idle • Ctrl+D exit',
+      'Shift+Tab cycle permission preset • Ctrl+G goal actions • Ctrl+C cancel/clear/exit • Ctrl+D exit',
       '',
       ...commandLines,
       '/skill:<name> [instructions] — load a skill into the conversation',
@@ -1512,6 +1613,44 @@ export function createTuiChat(
       handler: () => { resume.showResume(); return { kind: 'success' } },
     })
     commandCtx.commands.register({
+      name: 'queue',
+      description: 'Review queued steering messages (edit or remove)',
+      handler: () => { queueDock.showSheet(); return { kind: 'success' } },
+    })
+    commandCtx.commands.register({
+      name: 'rename',
+      description: 'Rename this session',
+      input: { hint: '[title]' },
+      handler: ({ rawInput }) => {
+        const title = rawInput.trim()
+        if (title !== '') {
+          renameSession(title)
+          return { kind: 'success' }
+        }
+        const session = overlayManager.open({
+          create: () => new RenameDialog(
+            sessionTitle ?? '',
+            palette,
+            renameSession,
+            () => { void session.close() },
+          ),
+          options: { width: 64, anchor: 'center', margin: 1 },
+        })
+        return { kind: 'success' }
+      },
+    })
+    commandCtx.commands.register({
+      name: 'fork',
+      description: 'Branch this session at its last completed turn',
+      handler: async () => {
+        await forkSession({
+          ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent,
+          ...runtime.handoffResume === undefined ? {} : { handoffResume: runtime.handoffResume },
+        })
+        return { kind: 'success' }
+      },
+    })
+    commandCtx.commands.register({
       name: 'status',
       description: 'Show session diagnostics, system prompt, and registered tools',
       handler: async ({ signal }) => { await showStatus(signal); return { kind: 'success' } },
@@ -1683,6 +1822,26 @@ export function createTuiChat(
     const restoreSubmittedInput = (): void => {
       if (editor.getText() === '') editor.setText(value)
     }
+    // An armed inbox edit REPLACES its queued message instead of dispatching.
+    const editTarget = queueDock.takeEditTarget()
+    if (editTarget !== undefined) {
+      editor.addToHistory(text)
+      editor.setText('')
+      const replacement = replaceQueuedMessage(editTarget, [{ type: 'text', text }])
+      if (agent.inbox.replace(editTarget.id, replacement)) {
+        pendingSteering.add(replacement.id)
+        appendNotice('Queued message updated.')
+      } else if (agent.status === 'running') {
+        // The target left the queue while editing; deliver as fresh steering.
+        agent.steer(replacement)
+        pendingSteering.add(replacement.id)
+      } else {
+        agent.followup(replacement)
+      }
+      queueDock.refresh()
+      refreshStatus()
+      return
+    }
     // `/skill:<name>` carries a colon, which the command registry's name
     // grammar rejects, so it is intercepted before generic command routing.
     if (text.startsWith(SKILL_COMMAND_PREFIX)) {
@@ -1748,6 +1907,16 @@ export function createTuiChat(
 
   const removeInputListener = ui.addInputListener((data) => {
     if (overlayManager.hasActiveOverlay()) return undefined
+    // Shift+Tab cycles permission presets (Claude Code's mode ring); the
+    // danger preset confirms through the risk dialog first.
+    if (matchesKey(data, Key.shift(Key.tab))) {
+      permissionController.cycle()
+      return { consume: true }
+    }
+    if (matchesKey(data, Key.ctrl('g'))) {
+      goalBar.showActions()
+      return { consume: true }
+    }
     if (matchesKey(data, Key.ctrl('o'))) {
       toggleTools()
       return { consume: true }
@@ -1788,6 +1957,11 @@ export function createTuiChat(
     if (event.type === 'tool/result') fileSearch.invalidate()
     recordEventUsage(tokens, event)
     if (event.type === 'turn/start' && runningStatus !== undefined) runningStatus.turn = event.data.turn
+    // Docks re-derive from the log: the goal bar on goal changes, the queue
+    // dock on inbox-affecting events; plan-mode switches re-derive the hint.
+    if (event.type === 'goal/change' || event.type === 'turn/start') goalBar.refresh()
+    if (event.type === 'agent/inbox/spliced' || event.type === 'user/message') queueDock.refresh()
+    if (event.type === 'plan/mode' || event.type === 'permission/preset') setStatus(agent.status)
     // Track live standalone compaction state.
     if (event.type === 'compaction/start' && event.data.turn === null) {
       if (compacting === undefined) {
@@ -1834,6 +2008,9 @@ export function createTuiChat(
     if (source !== agent) return
     if (pendingSteering.delete(message.id)) refreshStatus()
   })
+  const disposeInserted = ctx.on('agent/inbox/inserted', ({ agent: source }) => {
+    if (source === agent) queueDock.refresh()
+  })
   const disposeStatus = ctx.on('agent/status', ({ agent: source, status }) => {
     if (source !== agent) return
     // Leaving 'running' ends the turn's status line; clear any badge so the
@@ -1875,6 +2052,7 @@ export function createTuiChat(
     disposeSessionEvents()
     disposeDequeued()
     disposeDiscarded()
+    disposeInserted()
     disposeStatus()
     disposeError()
     disposeAgent()
@@ -1912,6 +2090,8 @@ export function createTuiChat(
   }
 
   rebuildTranscript(true)
+  goalBar.refresh()
+  queueDock.refresh()
   const restoredGoal = foldGoal(agent.session.events).goal
   /* v8 ignore next -- goal replay coverage lives with the goal seam; the TUI only formats its startup notice. */
   if (restoredGoal !== undefined && restoredGoal.phase !== 'complete') {
@@ -1938,6 +2118,8 @@ export function createTuiChat(
     )
     clearStatus()
     clearInterval(spinnerTimer)
+    approvals.drain()
+    approvals.unregister()
     questions.unregister()
     ui.stop()
     throw error

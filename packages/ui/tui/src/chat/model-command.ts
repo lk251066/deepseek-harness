@@ -143,6 +143,8 @@ export function createModelController(deps: ModelControllerDeps): ModelControlle
           selectModel(selection.choice, { effort: selection.reasoningEffort })
         },
         () => { void session.close() },
+        // F5 re-reads the advertised catalog in place.
+        () => readModelChoices(ctx, target.current),
       ),
       options: {
         width: resolved.modelDialogWidth,

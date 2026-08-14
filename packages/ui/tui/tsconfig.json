@@ -72,6 +72,15 @@
       "path": "../../interaction/user-questions"
     },
     {
+      "path": "../../interaction/user-approval"
+    },
+    {
+      "path": "../../interaction/permission-presets"
+    },
+    {
+      "path": "../../plan/plan-mode"
+    },
+    {
       "path": "../../runtime-diagnostics/invariants"
     }
   ]

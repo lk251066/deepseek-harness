@@ -79,10 +79,21 @@ export interface TuiHarnessOptions {
   mountSessionQuery?: boolean
 }
 
+/** The fake inbox the harness exposes for queue-dock suites. */
+export interface FakeInbox {
+  readonly nextStep: readonly UserMessage[]
+  readonly nextTurn: readonly UserMessage[]
+  replace(id: MessageId, message: UserMessage): boolean
+  remove(id: MessageId): boolean
+  seed(target: 'next-step' | 'next-turn', messages: UserMessage[]): void
+}
+
 export interface TuiHarness<TerminalType extends Terminal, Exit extends (code: number) => void> {
   ctx: Context
   session: Session
   agent: FakeAgent
+  /** The fake inbox's lanes; seed with `inbox.seed('next-step', [message])`. */
+  inbox: FakeInbox
   terminal: TerminalType
   exit: Exit
   controller: ReturnType<typeof createTuiChat>
@@ -194,10 +205,50 @@ export async function createTuiTestHarness<TerminalType extends Terminal, Exit e
   const injected: ContentBlock[][] = []
   const injectedOptions: UserMessage[] = []
   const cancelled: AgentCancelCause[] = []
+  // Fake inbox: array-backed lanes the queue-dock suites can seed and splice.
+  const inboxSteps: UserMessage[] = []
+  const inboxTurns: UserMessage[] = []
+  const fakeInbox = {
+    get nextStep() {
+      return [...inboxSteps] as readonly UserMessage[]
+    },
+    get nextTurn() {
+      return [...inboxTurns] as readonly UserMessage[]
+    },
+    get hasPending() {
+      return inboxSteps.length > 0 || inboxTurns.length > 0
+    },
+    replace(messageId: MessageId, newMessage: UserMessage) {
+      const index = inboxSteps.findIndex(message => message.id === messageId)
+      if (index >= 0) { inboxSteps[index] = newMessage; return true }
+      const turnIndex = inboxTurns.findIndex(message => message.id === messageId)
+      if (turnIndex >= 0) { inboxTurns[turnIndex] = newMessage; return true }
+      return false
+    },
+    remove(messageId: MessageId) {
+      const index = inboxSteps.findIndex(message => message.id === messageId)
+      if (index >= 0) { inboxSteps.splice(index, 1); return true }
+      const turnIndex = inboxTurns.findIndex(message => message.id === messageId)
+      if (turnIndex >= 0) { inboxTurns.splice(turnIndex, 1); return true }
+      return false
+    },
+    splice(target: 'next-step' | 'next-turn', start: number, deleteCount: number, inserted: UserMessage[]) {
+      const lane = target === 'next-step' ? inboxSteps : inboxTurns
+      return lane.splice(start, deleteCount, ...inserted)
+    },
+    clear() {
+      inboxSteps.length = 0
+      inboxTurns.length = 0
+    },
+    seed(target: 'next-step' | 'next-turn', messages: UserMessage[]) {
+      ;(target === 'next-step' ? inboxSteps : inboxTurns).push(...messages)
+    },
+  }
   const agent: FakeAgent = {
     id: sessionId,
     options: options.agentOptions ?? { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
     session,
+    inbox: fakeInbox as never,
     status: options.status ?? 'idle',
     get acceptsNextStep() {
       return options.acceptsNextStep ?? this.status === 'running'
@@ -262,7 +313,7 @@ export async function createTuiTestHarness<TerminalType extends Terminal, Exit e
     ...(options.goodbyeMessage === undefined ? {} : { goodbyeMessage: options.goodbyeMessage }),
     gitBranch: options.gitBranch ?? (() => 'tui-staging'),
   })
-  return { ctx, session, agent, terminal, exit, controller }
+  return { ctx, session, agent, inbox: fakeInbox as FakeInbox, terminal, exit, controller }
 }
 
 /** Dispose the mounted TUI before its owning Cordis context. */

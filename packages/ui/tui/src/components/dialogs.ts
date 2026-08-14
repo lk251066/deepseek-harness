@@ -9,6 +9,7 @@ import {
   Input,
   Key,
   SelectList,
+  Text,
   matchesKey,
   truncateToWidth,
   visibleWidth,
@@ -299,6 +300,10 @@ export class ModelDialog implements Component {
   private readonly choices: Map<string, ModelChoice>
   private readonly efforts: Map<string, ReasoningEffortId | undefined>
   private readonly currentValue: string | undefined
+  /** The route the dialog opened with; a refresh rebuilds against it. */
+  private readonly selection: ModelSelection | undefined
+  /** True while an F5 catalog refresh is in flight. */
+  private refreshing = false
 
   constructor(
     choices: readonly ModelChoice[],
@@ -307,11 +312,23 @@ export class ModelDialog implements Component {
     private readonly palette: Palette,
     private readonly done: (selection: ModelDialogSelection) => void,
     private readonly cancel: () => void,
+    /** F5 re-reads the catalog through this hook and rebuilds the list. */
+    private readonly onRefresh?: () => Promise<readonly ModelChoice[]>,
   ) {
     this.items = new Map()
     this.choices = new Map()
     this.efforts = new Map()
     this.currentValue = current === undefined ? undefined : targetLabel(current)
+    this.selection = current
+    this.rebuildItems(choices, current)
+    this.list = this.buildList(this.currentValue)
+  }
+
+  /** (Re)build the item/choice/effort tables from a catalog snapshot. */
+  private rebuildItems(choices: readonly ModelChoice[], current: ModelSelection | undefined): void {
+    this.choices.clear()
+    this.efforts.clear()
+    this.items.clear()
     for (const choice of choices) {
       const value = targetLabel(choice)
       const isCurrent = current?.provider === choice.provider && current.model === choice.model
@@ -328,7 +345,6 @@ export class ModelDialog implements Component {
         description: this.describeChoice(choice, isCurrent),
       })
     }
-    this.list = this.buildList(this.currentValue)
   }
 
   /** Build a SelectList over the currently filtered items, selecting `selectValue` when present. */
@@ -400,6 +416,22 @@ export class ModelDialog implements Component {
   handleInput(data: string): void {
     if (matchesKey(data, Key.shift(Key.tab))) {
       this.cycleReasoningEffort()
+    } else if (matchesKey(data, Key.f5) && this.onRefresh !== undefined && !this.refreshing) {
+      // Re-read the advertised catalog without leaving the selector.
+      this.refreshing = true
+      this.invalidate()
+      void this.onRefresh().then(
+        choices => {
+          this.refreshing = false
+          this.rebuildItems(choices, this.selection)
+          this.list = this.buildList(this.currentValue)
+          this.invalidate()
+        },
+        () => {
+          this.refreshing = false
+          this.invalidate()
+        },
+      )
     } else if (matchesKey(data, Key.escape)) {
       if (this.filter.getValue() === '') this.cancel()
       else {
@@ -436,7 +468,9 @@ export class ModelDialog implements Component {
         ? [this.palette.dim('  No models match the filter')]
         : this.list.render(innerWidth),
       '',
-      this.palette.dim('type to filter • ↑/↓ move • Shift+Tab reasoning • Enter select • Esc'),
+      this.refreshing
+        ? this.palette.dim('refreshing catalog…')
+        : this.palette.dim('type to filter • ↑/↓ move • Shift+Tab reasoning • F5 refresh • Enter select • Esc'),
     ], width, this.palette)
   }
 }
@@ -519,6 +553,187 @@ export interface ThemeChoice {
   name: string
   description: string
   dark: boolean
+}
+
+/**
+ * The `/rename` sheet: a single-line title editor. Enter renames (empty input
+ * rejects with the sheet's own error line), Esc/Ctrl+C closes unchanged.
+ */
+export class RenameDialog implements Component {
+  private readonly input = new Input()
+  private error: string | undefined
+
+  constructor(
+    initial: string,
+    private readonly palette: Palette,
+    private readonly submit: (title: string) => void,
+    private readonly close: () => void,
+  ) {
+    this.input.setValue(initial)
+    this.input.onSubmit = value => {
+      const title = value.trim()
+      if (title === '') {
+        this.error = 'A session title cannot be empty.'
+        this.invalidate()
+        return
+      }
+      this.submit(title)
+      this.close()
+    }
+    this.input.onEscape = close
+  }
+
+  invalidate(): void {
+    this.input.invalidate()
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.ctrl('c'))) {
+      this.close()
+      return
+    }
+    this.input.handleInput(data)
+    this.invalidate()
+  }
+
+  render(width: number): string[] {
+    const innerWidth = Math.max(1, width - 4)
+    return renderDialog('Rename session', [
+      ...this.input.render(innerWidth),
+      ...this.error === undefined ? [] : ['', this.palette.warning(displayText(this.error))],
+      '',
+      this.palette.dim('Enter rename • Esc cancel'),
+    ], width, this.palette)
+  }
+}
+
+/**
+ * A two-option confirmation (Confirm / Cancel) for risky actions — the
+ * danger-permission acknowledgement, mirroring the web RiskConfirmation modal.
+ * Esc and Ctrl+C cancel.
+ */
+export class ConfirmDialog implements Component {
+  private readonly list: SelectList
+
+  constructor(
+    private readonly title: string,
+    private readonly message: string,
+    private readonly palette: Palette,
+    private readonly choose: (confirmed: boolean) => void,
+    private readonly close: () => void,
+  ) {
+    const items: SelectItem[] = [
+      { value: 'confirm', label: 'Confirm', description: 'proceed' },
+      { value: 'cancel', label: 'Cancel', description: 'keep the current setting' },
+    ]
+    this.list = new SelectList(items, 2, dialogSelectTheme(palette))
+    this.list.onSelect = item => {
+      this.choose(item.value === 'confirm')
+      this.close()
+    }
+    this.list.onCancel = () => {
+      this.choose(false)
+      this.close()
+    }
+  }
+
+  invalidate(): void {
+    this.list.invalidate()
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.ctrl('c'))) {
+      this.choose(false)
+      this.close()
+    } else {
+      this.list.handleInput(data)
+    }
+    this.invalidate()
+  }
+
+  render(width: number): string[] {
+    const innerWidth = Math.max(1, width - 4)
+    return renderDialog(this.title, [
+      ...new Text(this.palette.warning(this.message), 0, 0).render(innerWidth),
+      '',
+      ...this.list.render(innerWidth),
+      '',
+      this.palette.dim('↑/↓ move • Enter confirm • Esc cancel'),
+    ], width, this.palette)
+  }
+}
+
+/** The approval dialog's answer vocabulary (an escalation switches the preset, then allows). */
+export type ApprovalChoice = 'allow-once' | 'escalate' | 'reject'
+
+/**
+ * The tool-approval prompt: a Claude-Code-style takeover above the editor while
+ * a tool call waits on the user's decision. Enter picks an option; Esc and
+ * Ctrl+C reject (the turn keeps running so the model sees the denial).
+ */
+export class ApprovalDialog implements Component {
+  private readonly list: SelectList
+  private readonly headline: readonly string[]
+
+  constructor(
+    toolName: string,
+    private readonly reason: string | undefined,
+    callSummary: string | undefined,
+    escalateLabel: string | undefined,
+    private readonly palette: Palette,
+    private readonly choose: (choice: ApprovalChoice) => void,
+    private readonly close: () => void,
+  ) {
+    const items: SelectItem[] = [
+      { value: 'allow-once', label: 'Allow once', description: 'run this call' },
+      ...escalateLabel === undefined ? [] : [{
+        value: 'escalate', label: escalateLabel, description: 'stop asking for this session',
+      }],
+      { value: 'reject', label: 'Reject', description: 'deny the call' },
+    ]
+    this.list = new SelectList(items, items.length, dialogSelectTheme(palette))
+    this.list.setSelectedIndex(0)
+    this.list.onSelect = item => {
+      this.choose(item.value as ApprovalChoice)
+      this.close()
+    }
+    this.list.onCancel = () => {
+      this.choose('reject')
+      this.close()
+    }
+    this.headline = [
+      this.palette.warning(`${displayText(toolName)} needs your approval`),
+      ...callSummary === undefined || callSummary === '' ? [] : [this.palette.dim(displayText(callSummary))],
+      ...this.reason === undefined || this.reason === '' ? [] : [this.palette.dim(`Reason: ${displayText(this.reason)}`)],
+      '',
+    ]
+  }
+
+  invalidate(): void {
+    this.list.invalidate()
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.ctrl('c'))) {
+      this.choose('reject')
+      this.close()
+    } else {
+      this.list.handleInput(data)
+    }
+    this.invalidate()
+  }
+
+  render(width: number): string[] {
+    const innerWidth = Math.max(1, width - 4)
+    const wrapped = this.headline.flatMap(line =>
+      line === '' ? [''] : new Text(line, 0, 0).render(innerWidth))
+    return renderDialog('Approval', [
+      ...wrapped,
+      ...this.list.render(innerWidth),
+      '',
+      this.palette.dim('↑/↓ move • Enter confirm • Esc/Ctrl+C reject'),
+    ], width, this.palette)
+  }
 }
 
 /**

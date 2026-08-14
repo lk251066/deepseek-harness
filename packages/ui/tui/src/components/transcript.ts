@@ -29,6 +29,13 @@ import type { FileDiff } from '@deepseek-ai/dsh-tools'
 import { preview, renderUnknownXml } from './xml-tool-output.ts'
 import { displayInlineText, displayText } from './text.ts'
 import { gradientText, type Palette } from './theme.ts'
+import {
+  fullLogoRows,
+  logoFullWidth,
+  logoSingleWordWidth,
+  paintLogoRow,
+  singleWordLogoRows,
+} from './logo.ts'
 import { contentText, type ParsedArguments } from './content.ts'
 import { progressiveTitle, settledTitle } from '../chat/tool-verbs.ts'
 import {
@@ -125,13 +132,17 @@ function renderDiff(
 const USER_PROMPT_MARKER = '> '
 
 /**
- * Borderless startup banner: the product title and an optional configured
- * subtitle on one compact line. No box frame and no session-id row — the
- * banner names the product and gets out of the way.
+ * The startup banner. Wide terminals get the block-letter DEEPSEEK HARNESS
+ * logo painted through the brand gradient (plus a welcome row and a shortcut
+ * tips row); mid-width drops to the DEEPSEEK word alone; narrow falls back to
+ * one compact text line. The sweep reveal and the shimmer pass clip/overlay
+ * whichever shape is on screen.
  */
 export class HeaderComponent implements Component {
   /** Columns of the banner currently revealed; `undefined` renders it whole. */
   private revealWidth: number | undefined
+  /** Left edge of the shimmer window over the logo; `undefined` = off. */
+  private shimmerOffset: number | undefined
 
   constructor(
     private readonly subtitle: () => string | undefined,
@@ -147,10 +158,38 @@ export class HeaderComponent implements Component {
     this.revealWidth = width
   }
 
+  /**
+   * Park the shimmer highlight at `offset` columns (or clear it).
+   * @param offset - Left edge of the highlight window, or `undefined` to clear.
+   */
+  setShimmerOffset(offset: number | undefined): void {
+    this.shimmerOffset = offset
+  }
+
   invalidate(): void {}
 
   render(width: number): string[] {
     const usable = Math.max(1, width - 2)
+    if (usable >= logoFullWidth()) return this.renderLogo(usable, fullLogoRows())
+    if (usable >= logoSingleWordWidth()) return this.renderLogo(usable, singleWordLogoRows())
+    return this.renderText(usable)
+  }
+
+  /** Block-letter logo rows plus the welcome and tips rows, reveal-clipped. */
+  private renderLogo(usable: number, rows: readonly string[]): string[] {
+    const lines = rows.map(row => ` ${paintLogoRow(row, this.palette, this.gradient, this.shimmerOffset)}`)
+    const subtitle = this.subtitle()
+    lines.push('', ` ${this.palette.dim(displayText(subtitle ?? DEFAULT_WELCOME))}`)
+    lines.push(` ${this.palette.dim(LOGO_TIPS)}`)
+    if (this.revealWidth === undefined) {
+      return lines.map(line => truncateToWidth(line, usable, ''))
+    }
+    const revealed = this.revealWidth
+    return lines.map(line => truncateToWidth(line, revealed, ''))
+  }
+
+  /** Narrow fallback: the one-line text banner. */
+  private renderText(usable: number): string[] {
     const name = this.gradient
       ? this.palette.bold(gradientText('DEEPSEEK'))
       : this.palette.bold(this.palette.accent('DEEPSEEK'))
@@ -165,6 +204,11 @@ export class HeaderComponent implements Component {
     return lines.map(wrapped => truncateToWidth(wrapped, revealed, ''))
   }
 }
+
+/** Welcome line under the logo when no title/welcome is configured. */
+const DEFAULT_WELCOME = '探索未至之境 — coding agent ready'
+/** Shortcut tips row under the welcome line. */
+const LOGO_TIPS = '/ commands · @ files · Ctrl+O cards · Shift+Tab mode · Ctrl+G goal'
 
 /**
  * One image content block, rendered through pi-tui's `Image` once the

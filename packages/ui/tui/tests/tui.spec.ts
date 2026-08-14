@@ -2882,7 +2882,10 @@ describe('pi-tui chat lifecycle and transcript', () => {
   })
 
   it('bare /details opens the transcript-details toggle and Tab applies immediately', async () => {
+    // The block-letter banner takes ~8 rows; give the notices room to stay
+    // inside the fake viewport so the assertions see them render.
     const result = await setup()
+    result.terminal.resize(140, 45)
     const open = async (): Promise<number> => {
       const from = result.terminal.output.length
       result.terminal.send('/details')
@@ -6906,14 +6909,23 @@ describe('terminal mounting', () => {
 })
 
 describe('banner sweep reveal', () => {
+  /** Strip SGR/OSC escapes so block-letter rows can be measured by width. */
+  const plainFrame = (output: string): string[] => output
+    .split('\n')
+    .map(line => line.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\x1b\][^\x07]*\x07/g, ''))
+
   it('renders the product name through the brand-gradient path when truecolor is enabled', async () => {
-    // The product name carries a per-letter 24-bit gradient from the brand
-    // indigo to light blue; the per-letter layout is pinned by the
-    // `banner-gradient` terminal snapshot.
+    // The block-letter logo paints column-by-column through the 24-bit brand
+    // gradient; the default fake width (88) fits the DEEPSEEK word alone.
     const result = await setup({ config: { theme: { color: true, truecolor: true } } })
     expect(result.terminal.output).toContain('\x1b[38;2;77;107;254m')
     expect(result.terminal.output).toContain('\x1b[38;2;36;152;255m')
-    expect(result.terminal.output).toContain('HARNESS')
+    expect(result.terminal.output).toContain('█')
+    // Widening the terminal upgrades to the full two-word logo.
+    result.terminal.resize(140, 40)
+    await tick()
+    const widest = Math.max(...plainFrame(result.terminal.output).map(line => line.length))
+    expect(widest).toBeGreaterThanOrEqual(90)
     await dispose(result)
   })
 
@@ -6928,19 +6940,14 @@ describe('banner sweep reveal', () => {
     while (!done() && Date.now() < deadline) await tick()
     intervals.mockRestore()
     cleared.mockRestore()
-    // The finished banner carries the title; the session id no longer has
-    // its own banner row, and the banner itself stays borderless (the
+    // The finished banner is the block-letter word plus the default welcome
+    // and tips rows; no session-id row, and no frame around the banner (the
     // rounded frame below belongs to the input box).
-    expect(result.terminal.output).toContain('DEEPSEEK')
-    expect(result.terminal.output).toContain('HARNESS')
-    const bannerLine = result.terminal.output.split('\n').find(line => line.includes('DEEPSEEK'))
+    expect(result.terminal.output).toContain('█')
+    expect(result.terminal.output).toContain('探索未至之境')
+    const bannerLine = plainFrame(result.terminal.output).find(line => line.includes('█'))
     expect(bannerLine).toBeDefined()
     expect(bannerLine).not.toContain('╭')
-    // A mid-sweep frame rendered a clipped title (`DEEPSEEK H…` short of the
-    // full `HARNESS`). The one-line banner repaints in place, so the clipped
-    // frame may sit mid-stream between escape sequences rather than on its
-    // own line — match the raw output.
-    expect(/DEEPSEEK H(?!ARNESS)/.test(result.terminal.output)).toBe(true)
     await dispose(result)
   })
 
@@ -6948,25 +6955,22 @@ describe('banner sweep reveal', () => {
     const result = await setup()
     await tick()
     expect(result.terminal.output).toContain('Coding agent ready.')
-    expect(result.terminal.output).toContain('DEEPSEEK')
-    const bannerLine = result.terminal.output.split('\n').find(line => line.includes('DEEPSEEK'))
+    expect(result.terminal.output).toContain('█')
+    const bannerLine = plainFrame(result.terminal.output).find(line => line.includes('█'))
     expect(bannerLine).not.toContain('╭')
-    // No reveal frames: the banner is drawn whole from the first render, so no
-    // clipped-title frame ever appears.
-    const clipped = result.terminal.output
-      .split('\n')
-      .some(line => line.includes('DEEPSEEK') && !line.includes('HARNESS'))
-    expect(clipped).toBe(false)
+    // No reveal frames: a configured welcome skips every startup animation.
+    expect(plainFrame(result.terminal.output).some(line => line.includes('DEEPSEEK'))).toBe(false)
     await dispose(result)
   })
 
   it('omits the subtitle line entirely when no welcome is configured', async () => {
     const result = await setup({ omitWelcome: true })
     const deadline = Date.now() + 5000
-    while (!result.terminal.output.includes('HARNESS') && Date.now() < deadline) await tick()
-    // Banner is the title alone — no subtitle line, no session-id row.
+    while (!result.terminal.output.includes('█') && Date.now() < deadline) await tick()
+    // Without a configured welcome the banner shows the default welcome line,
+    // never the deployment welcome or a session-id row.
     expect(result.terminal.output).toContain('deepseek-v4-flash')
-    expect(result.terminal.output).not.toContain('ready.')
+    expect(result.terminal.output).not.toContain('Coding agent ready.')
     expect(result.terminal.output).not.toContain('main-session')
     await dispose(result)
   })

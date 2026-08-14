@@ -233,7 +233,7 @@ export function brandText(text: string): string {
  * @param t - Position along the gradient; clamped to [0, 1].
  * @returns The interpolated `[r, g, b]` channels, each rounded to 0–255.
  */
-function brandColorAt(t: number): readonly [number, number, number] {
+export function brandColorAt(t: number): readonly [number, number, number] {
   const span = Math.min(Math.max(t, 0), 1) * (BRAND_GRADIENT.length - 1)
   const index = Math.min(Math.floor(span), BRAND_GRADIENT.length - 2)
   const local = span - index

@@ -112,6 +112,7 @@ import {
 } from './components/transcript.ts'
 import { FramedEditorComponent } from './components/framed-editor.ts'
 import { WorkingLineComponent } from './components/working-line.ts'
+import { logoFullWidth, logoSingleWordWidth, SHIMMER_INTERVAL_MS, SHIMMER_WIDTH } from './components/logo.ts'
 import {
   compactTargetLabel,
   ConfirmDialog,
@@ -2133,6 +2134,7 @@ export function createTuiChat(
     disposePromptChanges()
     for (const value of promptValues) value.dispose()
     stopBannerReveal()
+    stopLogoShimmer()
     disposeSessionEvents()
     disposeDequeued()
     disposeDiscarded()
@@ -2157,6 +2159,8 @@ export function createTuiChat(
     header.setRevealWidth(undefined)
   }
   const startBannerReveal = (): void => {
+    // A configured welcome skips every startup animation (sweep AND shimmer)
+    // so deployments and snapshot fixtures stay frame-deterministic.
     if (config.welcome !== undefined) return
     const total = Math.max(1, runtime.terminal.columns)
     const step = Math.max(1, Math.ceil(total / BANNER_REVEAL_STEPS))
@@ -2166,11 +2170,44 @@ export function createTuiChat(
       shown += step
       if (shown >= total) {
         stopBannerReveal()
+        startLogoShimmer()
       } else {
         header.setRevealWidth(shown)
       }
       requestRender()
     }, BANNER_REVEAL_INTERVAL_MS)
+  }
+
+  // After the banner settles, a bright shimmer window sweeps across the
+  // block-letter logo twice, then the gradient holds. Self-clearing; the
+  // dispose path and terminal shrinking (logo no longer fits) both stop it.
+  let shimmerTimer: ReturnType<typeof setInterval> | undefined
+  const stopLogoShimmer = (): void => {
+    if (shimmerTimer === undefined) return
+    clearInterval(shimmerTimer)
+    shimmerTimer = undefined
+    header.setShimmerOffset(undefined)
+  }
+  const startLogoShimmer = (): void => {
+    stopLogoShimmer()
+    if (!resolved.theme.color || runtime.terminal.columns < logoSingleWordWidth()) return
+    let offset = -SHIMMER_WIDTH
+    const end = logoFullWidth() + SHIMMER_WIDTH
+    const step = 2
+    let frames = 0
+    const maxFrames = Math.ceil((2 * (end + SHIMMER_WIDTH)) / step)
+    shimmerTimer = setInterval(() => {
+      frames += 1
+      if (frames > maxFrames || disposed) {
+        stopLogoShimmer()
+        requestRender()
+        return
+      }
+      header.setShimmerOffset(offset)
+      offset += step
+      if (offset > end) offset = -SHIMMER_WIDTH
+      requestRender()
+    }, SHIMMER_INTERVAL_MS)
   }
 
   rebuildTranscript(true)

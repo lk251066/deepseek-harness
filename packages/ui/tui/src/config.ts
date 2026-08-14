@@ -32,7 +32,7 @@ export interface TuiThemeConfig {
 
 /** Interaction and presentation settings for the pi-tui terminal mode. */
 export interface TuiConfig {
-  /** Render model reasoning blocks. */
+  /** Expand settled model reasoning blocks (default folds them to one line). */
   showReasoning?: boolean
   /** Maximum tool-card body lines retained in its collapsed head/tail preview. */
   maxToolOutputLines?: number
@@ -70,7 +70,7 @@ export interface TuiConfig {
   title?: string
 }
 
-const showReasoningSchema = z.boolean().default(true)
+const showReasoningSchema = z.boolean().default(false)
 const maxToolOutputLinesSchema = z.number().step(1).min(1).default(6)
 const maxDiffEditLengthSchema = z.number().step(1).min(1).default(1000)
 const maxQuestionOptionsSchema = z.number().step(1).min(1).default(8)
@@ -211,7 +211,7 @@ export interface ResolvedTuiConfig {
  */
 export function resolveTuiConfig(config: TuiConfig | undefined): ResolvedTuiConfig {
   return {
-    showReasoning: config?.showReasoning ?? true,
+    showReasoning: config?.showReasoning ?? false,
     maxToolOutputLines: config?.maxToolOutputLines ?? 6,
     maxDiffEditLength: config?.maxDiffEditLength ?? 1000,
     maxQuestionOptions: config?.maxQuestionOptions ?? 8,

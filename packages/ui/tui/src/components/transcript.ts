@@ -208,7 +208,7 @@ export class HeaderComponent implements Component {
 /** Welcome line under the logo when no title/welcome is configured. */
 const DEFAULT_WELCOME = '探索未至之境 — coding agent ready'
 /** Shortcut tips row under the welcome line. */
-const LOGO_TIPS = '/ commands · @ files · Ctrl+O cards · Shift+Tab mode · Ctrl+G goal'
+const LOGO_TIPS = '/ commands · @ files · /resume sessions · Ctrl+O cards · Shift+Tab mode'
 
 /**
  * One image content block, rendered through pi-tui's `Image` once the
@@ -281,9 +281,11 @@ export class UserMessageComponent extends Container {
 /**
  * Children of a settled assistant message: optional reasoning block then the
  * response text. Assistant prose carries no role header (the Claude Code
- * convention — tool cards and markers already band the message), and a folded
- * continuation with no visible body renders nothing at all, so tool-only
- * steps leave no blank segment behind.
+ * convention — tool cards and markers already band the message). A settled
+ * step folds its reasoning to one dim `∴ Thinking` line unless expanded
+ * (Claude Code's default), while a streaming step keeps the reasoning live;
+ * a folded continuation with no visible body renders nothing at all, so
+ * tool-only steps leave no blank segment behind.
  */
 function assistantMessageChildren(
   content: readonly ContentBlock[],
@@ -291,15 +293,21 @@ function assistantMessageChildren(
   foldedContinuation: boolean,
   palette: Palette,
   mdTheme: MarkdownTheme,
+  settled: boolean,
+  thinkingMs: number | undefined,
 ): Component[] {
   const reasoning = displayText(textBlocks(content, 'reasoning').trim())
   const text = displayText(textBlocks(content, 'text').trim())
-  const showsReasoning = reasoning !== '' && showReasoning
-  if (foldedContinuation && !showsReasoning && text === '') return []
+  const showsReasoning = reasoning !== '' && (!settled || showReasoning)
+  const foldsReasoning = settled && reasoning !== '' && !showReasoning
+  if (foldedContinuation && !showsReasoning && !foldsReasoning && text === '') return []
   const children: Component[] = [new Spacer(1)]
-  if (showsReasoning) {
+  if (foldsReasoning) {
+    const duration = thinkingMs === undefined ? '' : ` · ${formatStatusDuration(thinkingMs)}`
+    children.push(new Text(palette.italic(palette.dim(`∴ Thinking${duration} (ctrl+r to expand)`)), 0, 0))
+  } else if (showsReasoning) {
     children.push(
-      new Text(palette.italic(palette.dim('Reasoning')), 0, 0),
+      new Text(palette.italic(palette.dim('∴ Thinking…')), 0, 0),
       new Markdown(reasoning, 0, 0, mdTheme, { color: value => palette.dim(value), italic: true }),
     )
   }
@@ -318,6 +326,8 @@ export class StreamingAssistantComponent extends Container {
   private readonly blocks = new Map<number, StreamingBlock>()
   private settledContent: readonly ContentBlock[] | undefined
   private foldedContinuation = false
+  private startedAt: number | undefined
+  private thinkingMs: number | undefined
   constructor(
     /** The step's turn/step coordinates, used to group steps into its turn. */
     readonly position: StepPosition,
@@ -330,11 +340,24 @@ export class StreamingAssistantComponent extends Container {
   }
 
   /**
+   * Record the step's start time (its `step/start` event time) for the
+   * collapsed thinking line's duration.
+   * @param time - Step start in epoch milliseconds, or `undefined` when the
+   * opening event is unavailable (the duration is simply omitted).
+   */
+  markStart(time: number | undefined): void {
+    this.startedAt = time
+  }
+
+  /**
    * Replace the streamed blocks with the step's settled content.
    * @param content - The settled assistant content blocks.
+   * @param at - Settle time in epoch milliseconds (the `assistant/message`
+   * event time) for the collapsed thinking duration; omitted leaves it unset.
    */
-  settle(content: readonly ContentBlock[]): void {
+  settle(content: readonly ContentBlock[], at?: number): void {
     this.settledContent = content
+    if (at !== undefined && this.startedAt !== undefined) this.thinkingMs = Math.max(0, at - this.startedAt)
     this.rebuild()
   }
 
@@ -419,6 +442,8 @@ export class StreamingAssistantComponent extends Container {
       this.foldedContinuation,
       this.palette,
       this.mdTheme,
+      this.settledContent !== undefined,
+      this.thinkingMs,
     )
     for (const child of children) this.addChild(child)
   }

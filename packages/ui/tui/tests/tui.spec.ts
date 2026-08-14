@@ -185,7 +185,7 @@ function provideLlmCatalog(ctx: Context): void {
 describe('TUI config', () => {
   it('defaults every direct-call TUI option', () => {
     expect(resolveTuiConfig(undefined)).toEqual({
-      showReasoning: true,
+      showReasoning: false,
       maxToolOutputLines: 6,
       maxDiffEditLength: 1000,
       maxQuestionOptions: 8,
@@ -2863,15 +2863,15 @@ describe('pi-tui chat lifecycle and transcript', () => {
 
     await run('/details expanded reasoning off')
     expect(result.terminal.output).toContain('Tool and context cards expanded.')
-    expect(result.terminal.output).toContain('Reasoning blocks hidden.')
+    expect(result.terminal.output).toContain('Reasoning collapsed.')
 
     await run('/details reasoning on')
-    expect(result.terminal.output).toContain('Reasoning blocks shown.')
+    expect(result.terminal.output).toContain('Reasoning expanded.')
 
     // Bare `reasoning` toggles: shown -> hidden.
     const toggleOutput = result.terminal.output.length
     await run('/details reasoning')
-    expect(result.terminal.output.slice(toggleOutput)).toContain('Reasoning blocks hidden.')
+    expect(result.terminal.output.slice(toggleOutput)).toContain('Reasoning collapsed.')
     await run('/details collapsed')
     expect(result.terminal.output.slice(toggleOutput)).toContain('Tool and context cards collapsed.')
 
@@ -2915,11 +2915,12 @@ describe('pi-tui chat lifecycle and transcript', () => {
     await tick()
     expect(result.terminal.output).toContain('Tool and context cards collapsed.')
 
-    // The reasoning entry toggles the same way.
+    // The reasoning entry toggles the same way — the default is collapsed,
+    // so the first Tab expands.
     result.terminal.send('\x1b[B')
     result.terminal.send('\t')
     await tick()
-    expect(result.terminal.output).toContain('Reasoning blocks hidden.')
+    expect(result.terminal.output).toContain('Reasoning expanded.')
 
     // Enter closes without further changes.
     const entered = result.terminal.output.length
@@ -2930,7 +2931,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     // Esc and Ctrl+C also close; the reopened dialog shows the live values.
     const reopened = await open()
     expect(result.terminal.output.slice(reopened)).toContain('collapsed')
-    expect(result.terminal.output.slice(reopened)).toContain('hidden')
+    expect(result.terminal.output.slice(reopened)).toContain('shown')
     result.terminal.send('\x1b')
     await tick()
     const ctrlCOutput = await open()
@@ -2981,7 +2982,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     await tick()
 
     expect(result.terminal.output).toContain('Keyboard shortcuts')
-    expect(result.terminal.output).toContain('Reasoning blocks')
+    expect(result.terminal.output).toContain('Reasoning expanded.')
     expect(result.terminal.output).toContain('Tool and context cards')
     expect(result.terminal.output).toContain('Unknown command')
     // /reload without a Loader in the context degrades to a warning.

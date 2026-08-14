@@ -930,13 +930,14 @@ export function createTuiChat(
     completedStreaming = undefined
   }
 
-  const startAssistantStep = (position: StepPosition): void => {
+  const startAssistantStep = (position: StepPosition, startedAt?: number): void => {
     streaming = new StreamingAssistantComponent(
       position,
       showReasoning,
       palette,
       mdTheme,
     )
+    streaming.markStart(startedAt)
     registerAssistantStep(streaming)
     chat.addChild(streaming)
   }
@@ -992,7 +993,7 @@ export function createTuiChat(
         break
       }
       case 'step/start':
-        startAssistantStep(event.data)
+        startAssistantStep(event.data, event.time)
         break
       case 'assistant/chunk':
         if (options.renderChunks && streaming !== undefined) {
@@ -1006,9 +1007,11 @@ export function createTuiChat(
         completedStreaming = undefined
         // A settled component stays attached but never absorbs a later message
         // of the same step; both the live and replay paths start a new one.
-        if (streaming === undefined || streaming.isSettled() || !chat.children.includes(streaming)) startAssistantStep(event.data)
+        if (streaming === undefined || streaming.isSettled() || !chat.children.includes(streaming)) {
+          startAssistantStep(event.data, event.time)
+        }
         if (streaming !== undefined) {
-          streaming.settle(event.data.message.content)
+          streaming.settle(event.data.message.content, event.time)
           applyTurnFolding(streaming.position.turn)
         }
         break
@@ -1061,7 +1064,7 @@ export function createTuiChat(
         updateTerminalTitle()
         break
       case 'step/end':
-        if (streaming === undefined) startAssistantStep(event.data)
+        if (streaming === undefined) startAssistantStep(event.data, event.time)
         completedStreaming = streaming
         streaming = undefined
         break
@@ -1297,7 +1300,7 @@ export function createTuiChat(
       registerAssistantStep(activeStreaming)
       chat.addChild(activeStreaming)
     }
-    appendNotice(`Reasoning blocks ${showReasoning ? 'shown' : 'hidden'}.`)
+    appendNotice(`Reasoning ${showReasoning ? 'expanded' : 'collapsed'}.`)
   }
 
   const toggleReasoning = (): void => { setReasoning(!showReasoning) }
@@ -2349,8 +2352,14 @@ export function apply(ctx: Context, config: Config): void {
     throw new Error('ui-tui: both stdin and stdout must be TTYs; use the one-shot @deepseek-ai/dsh-cli-demo app for pipes')
   }
   // Truecolor is a terminal capability, so detect it here at the process
-  // boundary from COLORTERM; an explicit theme value still wins.
-  const truecolor = config.theme?.truecolor ?? ['truecolor', '24bit'].includes(process.env.COLORTERM ?? '')
+  // boundary: COLORTERM is the standard signal, but Windows Terminal only
+  // sets WT_SESSION and several other modern terminals announce themselves
+  // through TERM_PROGRAM; an explicit theme value still wins.
+  const truecolor = config.theme?.truecolor ?? (
+    ['truecolor', '24bit'].includes(process.env.COLORTERM ?? '')
+    || process.env.WT_SESSION !== undefined
+    || ['vscode', 'WezTerm', 'ghostty', 'iTerm.app', 'Hyper'].includes(process.env.TERM_PROGRAM ?? '')
+  )
   const resumeHost = ctx.get('tuiResumeHost')
   const goodbyeMessage = ctx.get('tuiGoodbyeMessage')
   // The launcher seeds a guided fresh session's first turn through this key; a

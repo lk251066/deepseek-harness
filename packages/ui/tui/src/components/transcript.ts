@@ -292,11 +292,33 @@ export function renderDiff(
 const USER_PROMPT_MARKER = '> '
 
 /**
- * The startup banner. Wide terminals get the block-letter DEEPSEEK HARNESS
- * logo painted through the brand gradient (plus a welcome row and a shortcut
- * tips row); mid-width drops to the DEEPSEEK word alone; narrow falls back to
- * one compact text line. The sweep reveal and the shimmer pass clip/overlay
- * whichever shape is on screen.
+ * Identity segments of the condensed one-line header: the product version,
+ * the active model label, the working directory, and the session title when
+ * one is set. An empty `model`/`version` omits that segment from the line.
+ */
+export interface CondensedHeaderInfo {
+  /** Package version rendered as `v{version}`. */
+  readonly version: string
+  /** Active model label (empty omits the segment). */
+  readonly model: string
+  /** Formatted working-directory label (empty omits the segment). */
+  readonly cwd: string
+  /** Session title appended as `— {title}`; `undefined`/empty omits it. */
+  readonly title: string | undefined
+}
+
+/**
+ * The startup banner. A fresh (history-less) session gets the full banner:
+ * the block-letter DEEPSEEK HARNESS logo painted through the brand gradient
+ * (plus a welcome row and a shortcut tips row); mid-width drops to the
+ * DEEPSEEK word alone; narrow falls back to one compact text line. The sweep
+ * reveal and the shimmer pass clip/overlay whichever shape is on screen.
+ *
+ * A session that already carries conversation (Claude Code's CondensedLogo
+ * convention) drops the five-row logo for one identity row instead — accent
+ * `dsh`, the product name, the version, the model, the cwd, and the session
+ * title — static, with no reveal or shimmer animation. Narrow terminals keep
+ * the plain text fallback either way.
  */
 export class HeaderComponent implements Component {
   /** Columns of the banner currently revealed; `undefined` renders it whole. */
@@ -308,6 +330,11 @@ export class HeaderComponent implements Component {
     private readonly subtitle: () => string | undefined,
     private readonly palette: Palette,
     private readonly gradient: boolean,
+    /**
+     * Condensed identity segments, read per render; `undefined` renders the
+     * full startup banner instead.
+     */
+    private readonly condensedInfo: () => CondensedHeaderInfo | undefined = () => undefined,
   ) {}
 
   /**
@@ -330,9 +357,33 @@ export class HeaderComponent implements Component {
 
   render(width: number): string[] {
     const usable = Math.max(1, width - 2)
+    const condensed = this.condensedInfo()
+    if (condensed !== undefined && usable >= logoSingleWordWidth()) return this.renderCondensed(usable, condensed)
     if (usable >= logoFullWidth()) return this.renderLogo(usable, fullLogoRows())
     if (usable >= logoSingleWordWidth()) return this.renderLogo(usable, singleWordLogoRows())
     return this.renderText(usable)
+  }
+
+  /**
+   * The condensed identity row: `dsh DEEPSEEK HARNESS v{version} · {model}
+   * {cwd} — {title}` on one line — bold name, dim metadata, the title last.
+   * Static by design: no reveal clip and no shimmer, whichever animation
+   * timers happen to run.
+   */
+  private renderCondensed(usable: number, info: CondensedHeaderInfo): string[] {
+    const segments = [
+      this.palette.bold(this.palette.accent('dsh')),
+      this.palette.bold('DEEPSEEK HARNESS'),
+      /* v8 ignore next -- an empty version only follows a failed manifest read (index.ts swallows it). */
+      ...info.version === '' ? [] : [this.palette.dim(`v${displayText(info.version)}`)],
+      ...info.model === '' ? [] : [this.palette.dim(`· ${displayText(info.model)}`)],
+      /* v8 ignore next -- formatCwd never returns an empty label ('cwd unset' stands in). */
+      ...info.cwd === '' ? [] : [this.palette.dim(displayText(info.cwd))],
+      /* v8 ignore next -- a titled session never folds an empty title back through the header. */
+      ...(info.title === undefined || info.title === '') ? [] : [this.palette.dim(`— ${displayText(info.title)}`)],
+    ]
+    const line = segments.join(' ')
+    return wrapTextWithAnsi(line, usable).map(wrapped => ` ${truncateToWidth(wrapped, usable, '')}`)
   }
 
   /** Block-letter logo rows plus the welcome and tips rows, reveal-clipped. */

@@ -5,6 +5,7 @@
  * @module @deepseek-ai/dsh-tui
  */
 
+import { createRequire } from 'node:module'
 import {
   CombinedAutocompleteProvider,
   Container,
@@ -103,6 +104,7 @@ import {
 } from './config.ts'
 import {
   CollapsedToolGroupComponent,
+  type CondensedHeaderInfo,
   ContextCardComponent,
   type ToolCardVisibility,
   HeaderComponent,
@@ -111,6 +113,7 @@ import {
   TodoComponent,
   UserMessageComponent,
 } from './components/transcript.ts'
+import { shortcutHint } from './components/figures.ts'
 import { FramedEditorComponent } from './components/framed-editor.ts'
 import { NoticeSlotComponent, type NoticeKind } from './components/notice-slot.ts'
 import { WorkingLineComponent } from './components/working-line.ts'
@@ -300,11 +303,30 @@ export const inject = ['agents', 'sessions', 'commands', 'userQuestions', 'tools
 export const FILE_REFERENCE_PROMPT = 'Paths prefixed with @ are files explicitly referenced by the user. Use the read tool when their contents are needed; do not claim to have inspected a file before reading it.'
 
 /**
- * Transcript row standing in for one compacted range. The conversation the
- * compaction replaced stays rendered above it: the marker reports where the
- * model stopped seeing that history, not that the history is gone.
+ * This package's version, read from its own manifest for the condensed
+ * header's `v{version}` segment. Read once through `createRequire` — the
+ * plain-JSON require path ignores the package `exports` map, and any read
+ * failure (a bundled build without the manifest beside it) simply drops the
+ * segment rather than failing the UI.
  */
-const COMPACTION_MARKER = '… earlier context was compacted …'
+const TUI_VERSION: string = (() => {
+  try {
+    const require = createRequire(import.meta.url)
+    const manifest = require('../package.json') as { version?: unknown }
+    /* v8 ignore next -- a manifest without a string version drops the segment, same as a failed read. */
+    return typeof manifest.version === 'string' ? manifest.version : ''
+  } catch {
+    /* v8 ignore next -- only a bundled build without the manifest beside it lands here. */
+    return ''
+  }
+})()
+
+/**
+ * Transcript row standing in for one compacted range while the full history is
+ * rendered (Ctrl+O expanded): the conversation above it stays visible, so the
+ * marker only reports where the model stopped seeing that history.
+ */
+const COMPACTION_BOUNDARY = '… earlier context was compacted …'
 
 /**
  * Low-signal read/search tools whose adjacent calls collapse into one summary
@@ -479,12 +501,30 @@ export function createTuiChat(
   // A configured subtitle renders as a banner line; when absent, the banner has
   // no subtitle. The banner itself sweeps in on start (see startBannerReveal).
   let sessionTitle = foldSessionTitle(agent.session.events)?.title
+  const formattedCwd = displayText(runtime.formatCwd?.(agent.session.header.cwd) ?? formatCwd(agent.session.header.cwd))
+  /**
+   * Condensed identity segments for a session that already carries
+   * conversation (Claude Code's CondensedLogo convention): the five-row
+   * startup banner yields to one `dsh DEEPSEEK HARNESS v… · model cwd —
+   * title` row, read per render so the header collapses the moment the first
+   * user message lands. A history-less session gets the full banner instead.
+   */
+  const condensedHeaderInfo = (): CondensedHeaderInfo | undefined => {
+    const started = agent.session.events.some(event => event.type === 'user/message')
+    if (!started) return undefined
+    return {
+      version: TUI_VERSION,
+      model: target.current === undefined ? '' : compactTargetLabel(target.current),
+      cwd: formattedCwd,
+      title: sessionTitle,
+    }
+  }
   const header = new HeaderComponent(
     () => sessionTitle ?? config.welcome,
     palette,
     resolved.theme.color && resolved.theme.truecolor,
+    condensedHeaderInfo,
   )
-  const formattedCwd = displayText(runtime.formatCwd?.(agent.session.header.cwd) ?? formatCwd(agent.session.header.cwd))
   const branch = runtime.gitBranch?.(cwd) ?? gitBranch(cwd)
   const promptValues: TuiPromptValueHandle[] = [
     ctx.tuiPrompt.register('cwd', palette.bold(palette.accent(formattedCwd))),
@@ -1261,16 +1301,45 @@ export function createTuiChat(
     }
   }
 
-  const renderCompactionMarker = (): void => {
+  /**
+   * Transcript row at a landed compaction boundary: one dim line naming how
+   * much history folded away (Claude Code's boundary convention) instead of
+   * re-rendering the replaced conversation above it.
+   */
+  const renderCompactionFold = (foldedMessages: number): void => {
     chat.addChild(new Spacer(1))
-    chat.addChild(new Text(palette.dim(COMPACTION_MARKER), 0, 0))
+    chat.addChild(new Text(palette.dim(
+      `⋯ ${foldedMessages} earlier message${foldedMessages === 1 ? '' : 's'} compacted ${shortcutHint('ctrl+o', 'expand')}`,
+    ), 0, 0))
+  }
+
+  /** The static boundary marker one checkpoint renders in expanded replay. */
+  const renderCompactionBoundary = (): void => {
+    chat.addChild(new Spacer(1))
+    chat.addChild(new Text(palette.dim(COMPACTION_BOUNDARY), 0, 0))
   }
 
   /**
-   * Replay the human transcript from the append-only log. The model-visible
-   * surface shadows compacted ranges, so it is not the source here: every
-   * append-origin message stays rendered, and a replacement contributes at most
-   * the compaction marker at its own log position.
+   * The log index of the LAST landed compaction checkpoint, or `-1` when the
+   * session never compacted. Only the last boundary matters: any earlier one
+   * sits inside the range it folds.
+   */
+  const lastCompactCheckpointIndex = (events: readonly SessionEvent[]): number => {
+    let boundary = -1
+    for (const [index, event] of events.entries()) {
+      if (isCompactCheckpoint(event)) boundary = index
+    }
+    return boundary
+  }
+
+  /**
+   * Replay the human transcript from the append-only log. The conversation a
+   * compaction replaced folds away at its last boundary (Claude Code's
+   * behavior): the transcript renders only the post-boundary events plus one
+   * dim fold row counting the dropped messages, while Ctrl+O's expanded phase
+   * restores the full history (every checkpoint then marks its own boundary
+   * row, the pre-fold layout). Everything else is append-origin and renders
+   * in log order.
    *
    * The `tool/call` pairing check has no live counterpart, because only replay
    * can meet an orphan: `tool/call` carries no `surfaceOp` of its own, so it
@@ -1289,9 +1358,28 @@ export function createTuiChat(
     streaming = undefined
     todo.update([])
     const transcriptCalls = transcriptToolCallIds(agent.session)
-    for (const event of agent.session.events) {
+    const events = agent.session.events
+    const boundary = toolsVisibility === 'expanded' ? -1 : lastCompactCheckpointIndex(events)
+    let foldedMessages = 0
+    for (const [index, event] of events.entries()) {
       if (isReplacementSurfaceEvent(event)) {
-        if (isCompactCheckpoint(event)) renderCompactionMarker()
+        if (isCompactCheckpoint(event)) {
+          // The last checkpoint owns the fold row; in expanded replay (no
+          // fold, boundary -1) every checkpoint marks its own range instead.
+          if (index === boundary) renderCompactionFold(foldedMessages)
+          else if (boundary === -1) renderCompactionBoundary()
+        }
+        continue
+      }
+      if (index < boundary) {
+        // Folded range: nothing renders, but a resumed session's prompt
+        // history still learns its prompts, the way the unfolded replay did.
+        if (event.type === 'user/message' && event.data.source.kind === 'user') {
+          foldedMessages += 1
+          const text = displayText(contentText(event.data.content).trim())
+          /* v8 ignore next -- an image-only folded prompt carries no history text to learn. */
+          if (populateHistory && text) editor.addToHistory(text)
+        }
         continue
       }
       if (event.type === 'tool/call' && !transcriptCalls.has(event.data.callId)) continue
@@ -1473,6 +1561,11 @@ export function createTuiChat(
 
   const setToolsVisibility = (next: ToolCardVisibility): void => {
     toolsVisibility = next
+    // The compact history fold keys off the expanded phase, so a session that
+    // ever compacted re-derives its transcript on every phase switch: expanded
+    // restores the folded history, the other phases fold it again. The loops
+    // below then re-apply the phase to the rebuilt components idempotently.
+    if (lastCompactCheckpointIndex(agent.session.events) >= 0) rebuildTranscript(false)
     for (const card of allToolCards) card.setVisibility(toolsVisibility)
     // Group rows ride the same cycle: hidden drops the summary, expanded lists
     // the member cards (the loop above already set their own visibility).
@@ -2298,9 +2391,11 @@ export function createTuiChat(
       return
     }
     // A replacement mutates only the model surface, so the rendered transcript
-    // keeps what it already showed; a landed summary checkpoint adds its marker.
+    // keeps what it already showed; a landed summary checkpoint folds the
+    // history it replaced, so the transcript is re-derived from the log rather
+    // than patched in place — the fold removes components already attached.
     if (isReplacementSurfaceEvent(event)) {
-      if (isCompactCheckpoint(event)) renderCompactionMarker()
+      if (isCompactCheckpoint(event)) rebuildTranscript(false)
       requestRender()
       return
     }
@@ -2385,8 +2480,9 @@ export function createTuiChat(
   }
   const startBannerReveal = (): void => {
     // A configured welcome skips every startup animation (sweep AND shimmer)
-    // so deployments and snapshot fixtures stay frame-deterministic.
-    if (config.welcome !== undefined) return
+    // so deployments and snapshot fixtures stay frame-deterministic. A session
+    // resuming with history shows the condensed header, which animates nothing.
+    if (config.welcome !== undefined || condensedHeaderInfo() !== undefined) return
     const total = Math.max(1, runtime.terminal.columns)
     const step = Math.max(1, Math.ceil(total / BANNER_REVEAL_STEPS))
     let shown = 0

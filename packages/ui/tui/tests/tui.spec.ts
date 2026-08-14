@@ -5517,7 +5517,7 @@ describe('tool cards and surface replay', () => {
     await dispose(result)
   })
 
-  it('keeps append-origin history and marks a landed compaction, live and on rebuild', async () => {
+  it('folds pre-compaction history to one boundary row, live and on rebuild', async () => {
     const result = await setup({ tools })
     appendUser(result.session, 'old prompt')
     result.session.append('assistant/message', {
@@ -5589,37 +5589,59 @@ describe('tool cards and surface replay', () => {
     result.terminal.resize(89)
     await tick()
     const liveRender = result.terminal.output.slice(result.terminal.output.lastIndexOf('\x1b[2J'))
-    expect(liveRender).toContain('old prompt')
-    // The shadowed step keeps its card: one call row, one full result, no
-    // second card from the pruned copy.
-    expect(liveRender.split('$ printf hello')).toHaveLength(2)
-    expect(liveRender).toContain('third')
-    expect(liveRender.split('[exit 0]')).toHaveLength(2)
-    expect(liveRender.split('… earlier context was compacted …')).toHaveLength(2)
+    // The compacted history folds away: the prompt, its tool card, and the
+    // result render nothing, and one dim boundary row counts the single
+    // dropped human message.
+    expect(liveRender).not.toContain('old prompt')
+    expect(liveRender).not.toContain('$ printf hello')
+    expect(liveRender).not.toContain('third')
+    expect(liveRender).not.toContain('[exit 0]')
+    expect(liveRender.split('⋯ 1 earlier message compacted')).toHaveLength(2)
     expect(liveRender).not.toContain('model-only summary payload')
     expect(liveRender).not.toContain('generic replacement copy')
     expect(liveRender).not.toContain('foreign plugin replacement copy')
 
     // Ctrl+R toggles reasoning, which rebuilds the transcript from the log; the
-    // replayed projection matches what the live appends produced, including the
-    // shadowed assistant message's tool card.
+    // replayed projection matches what the live rebuild produced.
     result.terminal.send('\x12')
     await tick()
     result.terminal.resize(90)
     await tick()
     const replayRender = result.terminal.output.slice(result.terminal.output.lastIndexOf('\x1b[2J'))
-    expect(replayRender).toContain('old prompt')
-    expect(replayRender.split('$ printf hello')).toHaveLength(2)
-    expect(replayRender).toContain('third')
-    expect(replayRender.split('[exit 0]')).toHaveLength(2)
-    expect(replayRender.split('… earlier context was compacted …')).toHaveLength(2)
+    expect(replayRender).not.toContain('old prompt')
+    expect(replayRender).not.toContain('$ printf hello')
+    expect(replayRender.split('⋯ 1 earlier message compacted')).toHaveLength(2)
     expect(replayRender).not.toContain('model-only summary payload')
     expect(replayRender).not.toContain('generic replacement copy')
     expect(replayRender).not.toContain('foreign plugin replacement copy')
+
+    // Ctrl+O's expanded phase restores the folded history (the boundary turns
+    // into the static marker under the preserved conversation); the next press
+    // re-folds it.
+    result.terminal.send('\x0f')
+    await tick()
+    result.terminal.resize(91)
+    await tick()
+    const expandedRender = result.terminal.output.slice(result.terminal.output.lastIndexOf('\x1b[2J'))
+    expect(expandedRender).toContain('old prompt')
+    // The shadowed step keeps its card: one call row, one full result, no
+    // second card from the pruned copy.
+    expect(expandedRender.split('$ printf hello')).toHaveLength(2)
+    expect(expandedRender).toContain('third')
+    expect(expandedRender.split('[exit 0]')).toHaveLength(2)
+    expect(expandedRender.split('… earlier context was compacted …')).toHaveLength(2)
+    expect(expandedRender).not.toContain('⋯ 1 earlier message compacted')
+    result.terminal.send('\x0f')
+    await tick()
+    result.terminal.resize(92)
+    await tick()
+    const refoldedRender = result.terminal.output.slice(result.terminal.output.lastIndexOf('\x1b[2J'))
+    expect(refoldedRender).not.toContain('old prompt')
+    expect(refoldedRender).toContain('⋯ 1 earlier message compacted')
     await dispose(result)
   })
 
-  it('replays a stored compaction as preserved history plus its marker', async () => {
+  it('replays a stored compaction as one folded boundary row', async () => {
     const result = await setup({
       beforeMount(session) {
         appendUser(session, 'prompt before compaction')
@@ -5643,16 +5665,34 @@ describe('tool cards and surface replay', () => {
           surfaceOp: { op: 'replace', start: nodes[0], end: nodes.at(-1) as number },
           sourceEventSeqs: nodes,
         })
+        // A later exchange compacts again: only the LAST checkpoint owns the
+        // fold row, and everything before it — first checkpoint included —
+        // folds silently into that one boundary.
+        const second = session.append('user/message', createUserMessage({
+          content: [{ type: 'text', text: 'prompt after first compaction' }],
+          source: { kind: 'user' },
+        }), { surfaceOp: 'append' })
+        session.append('user/message', createUserMessage({
+          content: [{ type: 'text', text: '<context_checkpoint>second payload</context_checkpoint>' }],
+          source: compactCheckpointSource(CompactionId('test-compaction-2')),
+        }), {
+          surfaceOp: { op: 'replace', start: second.seq, end: second.seq },
+          sourceEventSeqs: [second.seq],
+        })
       },
     })
     result.terminal.resize(89)
     await tick()
 
     const mounted = result.terminal.output.slice(result.terminal.output.lastIndexOf('\x1b[2J'))
-    expect(mounted).toContain('prompt before compaction')
-    expect(mounted).toContain('reply before compaction')
-    expect(mounted.split('… earlier context was compacted …')).toHaveLength(2)
+    // The stored history folds behind the boundary row counting both human
+    // messages it replaced; the model-only checkpoint payloads never render.
+    expect(mounted).not.toContain('prompt before compaction')
+    expect(mounted).not.toContain('reply before compaction')
+    expect(mounted).not.toContain('prompt after first compaction')
+    expect(mounted.split('⋯ 2 earlier messages compacted')).toHaveLength(2)
     expect(mounted).not.toContain('stored model-only payload')
+    expect(mounted).not.toContain('second payload')
     await dispose(result)
   })
 

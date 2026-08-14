@@ -313,7 +313,7 @@ export async function createTuiTestHarness<TerminalType extends Terminal, Exit e
     ...(options.goodbyeMessage === undefined ? {} : { goodbyeMessage: options.goodbyeMessage }),
     gitBranch: options.gitBranch ?? (() => 'tui-staging'),
   })
-  return { ctx, session, agent, inbox: fakeInbox as FakeInbox, terminal, exit, controller }
+  return { ctx, session, agent, inbox: fakeInbox, terminal, exit, controller }
 }
 
 /** Dispose the mounted TUI before its owning Cordis context. */

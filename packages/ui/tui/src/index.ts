@@ -92,7 +92,6 @@ import {
   runningPhaseGlyph,
   STATUS_ANIMATION_INTERVAL_MS,
   STATUS_FADE_MS,
-  StepTimingTracker,
   TIMING_BUCKET_GLYPHS,
   TOOL_SPINNER_FRAMES,
   TOOL_SPINNER_INTERVAL_MS,
@@ -111,6 +110,8 @@ import {
   TodoComponent,
   UserMessageComponent,
 } from './components/transcript.ts'
+import { FramedEditorComponent } from './components/framed-editor.ts'
+import { WorkingLineComponent } from './components/working-line.ts'
 import {
   compactTargetLabel,
   ConfirmDialog,
@@ -360,7 +361,7 @@ export function createTuiChat(
   const initialPreset = resolved.theme.name === 'deepseek' ? undefined : THEME_PRESETS[resolved.theme.name]
   let currentPreset: ThemePreset | undefined = initialPreset
   let currentThemeName = initialPreset === undefined ? 'deepseek' : resolved.theme.name
-  const paletteOptions = (): { preset?: ThemePreset, truecolor?: boolean } => currentPreset === undefined
+  const paletteOptions = (): { preset?: ThemePreset; truecolor?: boolean } => currentPreset === undefined
     ? {}
     : { preset: currentPreset, truecolor: resolved.theme.truecolor }
   const palette = createPalette(resolved.theme.color, 'dark', paletteOptions())
@@ -398,9 +399,6 @@ export function createTuiChat(
   let toolsVisibility: ToolCardVisibility = 'collapsed'
   let streaming: StreamingAssistantComponent | undefined
   let completedStreaming: StreamingAssistantComponent | undefined
-  // One shared accumulator serves every step's timing footer; per-footer
-  // replay of the whole log is quadratic on a long resumed session.
-  const stepTimingTracker = new StepTimingTracker()
   // Assistant step components in model order per turn, for hidden-mode folding:
   // with tool cards hidden, a turn keeps one Assistant header and later steps
   // render as headerless continuations (see applyTurnFolding).
@@ -454,7 +452,6 @@ export function createTuiChat(
   // no subtitle. The banner itself sweeps in on start (see startBannerReveal).
   let sessionTitle = foldSessionTitle(agent.session.events)?.title
   const header = new HeaderComponent(
-    agent,
     () => sessionTitle ?? config.welcome,
     palette,
     resolved.theme.color && resolved.theme.truecolor,
@@ -474,7 +471,10 @@ export function createTuiChat(
     ctx.tuiPrompt.register('plan'),
     ctx.tuiPrompt.register('stats'),
   ]
-  const [cwdValue, gitValue, tokenValue, modelValue, contextValue, queuedValue, symbolValue, indicatorValue, permissionValue, planValue, statsValue] = promptValues
+  const [
+    cwdValue, gitValue, tokenValue, modelValue, contextValue, queuedValue,
+    symbolValue, indicatorValue, permissionValue, planValue, statsValue,
+  ] = promptValues
   /* v8 ignore next -- the fixed built-in registration list always supplies each handle. */
   if (cwdValue === undefined || gitValue === undefined || tokenValue === undefined || modelValue === undefined
     || contextValue === undefined || queuedValue === undefined || symbolValue === undefined || indicatorValue === undefined
@@ -487,7 +487,7 @@ export function createTuiChat(
    * route's context window. Absent, callers fall back to the token-meter
    * measure the footer already uses.
    */
-  const contextPressure = (): { projectedTokens?: number, pressureTokens?: number, contextWindow?: number } | undefined => {
+  const contextPressure = (): { projectedTokens?: number; pressureTokens?: number; contextWindow?: number } | undefined => {
     const projections = ctx.get('sessionProjections')
     if (projections === undefined) return undefined
     try {
@@ -495,9 +495,7 @@ export function createTuiChat(
         snapshot?: (session: unknown) => { values?: Record<string, unknown> } | undefined
       }).snapshot?.(agent.session)
       const pressure = snapshot?.values?.contextPressure
-      return pressure === undefined ? undefined : pressure as {
-        projectedTokens?: number, pressureTokens?: number, contextWindow?: number
-      }
+      return pressure === undefined ? undefined : pressure as NonNullable<ReturnType<typeof contextPressure>>
     } catch {
       // An unavailable projection never breaks the prompt footer.
       return undefined
@@ -586,9 +584,14 @@ export function createTuiChat(
   const docks = new Container()
   ui.addChild(docks)
   ui.addChild(compactionStatusLine)
-  ui.addChild(promptContext)
   ui.addChild(questionContainer)
-  ui.addChild(editor)
+  // Claude Code chrome: the working status line sits directly above the
+  // rounded input box, and the prompt's context row moves below it.
+  const workingLine = new WorkingLineComponent(palette, now)
+  ui.addChild(workingLine)
+  const editorFrame = new FramedEditorComponent(editor)
+  ui.addChild(editorFrame)
+  ui.addChild(promptContext)
   ui.setFocus(editor)
   const updateTerminalTitle = (): void => {
     runtime.terminal.setTitle(displayText(
@@ -708,7 +711,7 @@ export function createTuiChat(
   const goalBar = createGoalBar({ ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent })
   const queueDock = createQueueDock({
     ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent,
-    loadIntoEditor: text => {
+    loadIntoEditor: (text) => {
       editor.setText(text)
       requestRender()
     },
@@ -722,7 +725,7 @@ export function createTuiChat(
   /** Resolve one stored image attachment's bytes through the optional store. */
   const loadAttachmentImage = (attachmentId: string): Promise<Uint8Array | undefined> => {
     const attachments = ctx.get('attachments') as {
-      readImage?: (ref: { attachmentId: string, mediaType: string }, signal?: AbortSignal) => Promise<{ data: Uint8Array }>
+      readImage?: (ref: { attachmentId: string; mediaType: string }, signal?: AbortSignal) => Promise<{ data: Uint8Array }>
     } | undefined
     if (attachments?.readImage === undefined) return Promise.resolve(undefined)
     return attachments.readImage({ attachmentId, mediaType: 'image/png' }).then(
@@ -805,6 +808,9 @@ export function createTuiChat(
       }
       runningStatus = running
       runtime.terminal.setProgress(true)
+      // Show the working line immediately; the spinner tick takes over on its
+      // first frame (≤100 ms later).
+      workingLine.update(true, running.startedAt, undefined, undefined)
     }
     requestRender()
   }
@@ -832,16 +838,38 @@ export function createTuiChat(
   }
 
   // One process-wide spinner tick: the newest pending tool card animates its
-  // braille frame. Self-gating — the tick does nothing while no card pends.
+  // braille frame, and the working line above the input mirrors the same
+  // frame plus the call's verb label. While nothing pends (or the agent is
+  // idle) the card update is skipped; the working line itself renders empty
+  // when idle, so the tick is effectively self-gating.
   let spinnerFrame = 0
+  let workShown = false
   const spinnerTimer = setInterval(() => {
     if (disposed) return
+    const frame = TOOL_SPINNER_FRAMES[spinnerFrame++ % TOOL_SPINNER_FRAMES.length] ?? TOOL_SPINNER_FRAMES[0]
     let pending: ToolCardComponent | undefined
     for (const card of allToolCards) {
       if (card.isPending()) pending = card
     }
-    if (pending === undefined) return
-    pending.setSpinner(TOOL_SPINNER_FRAMES[spinnerFrame++ % TOOL_SPINNER_FRAMES.length] ?? TOOL_SPINNER_FRAMES[0])
+    const running = runningStatus !== undefined || compacting !== undefined
+    // Idle steady state (nothing pending, nothing running): the previous tick
+    // already rendered the empty line, so skip — this keeps the timer free.
+    if (pending === undefined && !running) {
+      if (workShown) {
+        workShown = false
+        workingLine.update(false, undefined, undefined, undefined)
+        requestRender()
+      }
+      return
+    }
+    workShown = true
+    if (pending !== undefined) pending.setSpinner(frame)
+    workingLine.update(
+      running,
+      runningStatus?.startedAt ?? compacting?.startedAt,
+      pending?.label(),
+      frame,
+    )
     requestRender()
   }, TOOL_SPINNER_INTERVAL_MS)
 
@@ -876,36 +904,18 @@ export function createTuiChat(
 
   const removeStreaming = (current: StreamingAssistantComponent | undefined): void => {
     if (current === undefined) return
-    for (const child of [current, current.timing]) {
-      const index = chat.children.indexOf(child)
-      /* v8 ignore next -- streaming components and their timing footers are retained only while attached to the chat. */
-      if (index >= 0) chat.children.splice(index, 1)
-    }
+    const index = chat.children.indexOf(current)
+    /* v8 ignore next -- streaming components are retained only while attached to the chat. */
+    if (index >= 0) chat.children.splice(index, 1)
     const steps = assistantSteps.get(current.position.turn)
     /* v8 ignore next -- every attached streaming component is registered in the fold map. */
     if (steps === undefined) return
-    const index = steps.indexOf(current)
+    const stepIndex = steps.indexOf(current)
     /* v8 ignore next -- registration precedes attachment, so the component is present until this removal. */
-    if (index < 0) return
-    steps.splice(index, 1)
+    if (stepIndex < 0) return
+    steps.splice(stepIndex, 1)
     // A retracted step may have owned the turn's hidden-mode header.
     applyTurnFolding(current.position.turn)
-  }
-
-  /**
-   * Move the running step's timing footer to the tail of the chat so it trails
-   * the tool cards the step just appended. A completed footer (its step ended,
-   * so `streaming` is cleared) stays pinned where it is.
-   */
-  const trailStreamingTiming = (): void => {
-    /* v8 ignore next -- every replayed tool event follows its step/start, so an open step always owns an attached footer here. */
-    if (streaming === undefined) return
-    const footer = streaming.timing
-    const index = chat.children.indexOf(footer)
-    /* v8 ignore next -- the open step's footer is attached to the chat whenever a tool event of that step renders. */
-    if (index < 0) return
-    chat.children.splice(index, 1)
-    chat.addChild(footer)
   }
 
   const clearStreaming = (): void => {
@@ -922,16 +932,12 @@ export function createTuiChat(
   const startAssistantStep = (position: StepPosition): void => {
     streaming = new StreamingAssistantComponent(
       position,
-      () => agent.session.events,
-      stepTimingTracker,
-      now,
       showReasoning,
       palette,
       mdTheme,
     )
     registerAssistantStep(streaming)
     chat.addChild(streaming)
-    chat.addChild(streaming.timing)
   }
 
   const renderEvent = (
@@ -979,7 +985,7 @@ export function createTuiChat(
           .map(block => ({ attachmentId: String(block.attachment.attachmentId), mediaType: block.attachment.mediaType }))
         if (text || images.length > 0) {
           chat.addChild(new Spacer(1))
-          chat.addChild(new UserMessageComponent(text, palette, mdTheme, 'You', images, loadAttachmentImage))
+          chat.addChild(new UserMessageComponent(text, palette, images, loadAttachmentImage))
           if (options.addHistory && text) editor.addToHistory(text)
         }
         break
@@ -1018,7 +1024,6 @@ export function createTuiChat(
       // gap, so the hidden state removes the row and the gap together.
       case 'tool/call':
         chat.addChild(parsedTool(event))
-        trailStreamingTiming()
         break
       case 'tool/result': {
         const callId = event.data.message.source.callId
@@ -1040,7 +1045,6 @@ export function createTuiChat(
         }
         card.updateResult(event.data, event.time)
         toolCards.delete(callId)
-        trailStreamingTiming()
         break
       }
       case 'todo/write':
@@ -1057,7 +1061,6 @@ export function createTuiChat(
         break
       case 'step/end':
         if (streaming === undefined) startAssistantStep(event.data)
-        streaming?.complete(event.time)
         completedStreaming = streaming
         streaming = undefined
         break
@@ -1292,7 +1295,6 @@ export function createTuiChat(
       streaming.setShowReasoning(showReasoning)
       registerAssistantStep(activeStreaming)
       chat.addChild(activeStreaming)
-      chat.addChild(activeStreaming.timing)
     }
     appendNotice(`Reasoning blocks ${showReasoning ? 'shown' : 'hidden'}.`)
   }

@@ -68,8 +68,8 @@ function projectionValue<T>(deps: InsightsDeps, key: string): T | undefined {
 
 /** The `/context` body rows: occupancy header, segmented bar, per-source rows. */
 export function contextLines(deps: InsightsDeps, palette: Palette): string[] {
-  const pressure = projectionValue<{ projectedTokens?: number, pressureTokens?: number, contextWindow?: number }>(deps, 'contextPressure')
-  const breakdown = projectionValue<{ systemTokens?: number, toolsTokens?: number, messageTokens?: number }>(deps, 'contextBreakdown')
+  const pressure = projectionValue<{ projectedTokens?: number; pressureTokens?: number; contextWindow?: number }>(deps, 'contextPressure')
+  const breakdown = projectionValue<{ systemTokens?: number; toolsTokens?: number; messageTokens?: number }>(deps, 'contextBreakdown')
   const used = pressure?.projectedTokens ?? pressure?.pressureTokens
     ?? deps.ctx.tokenMeter.measure(deps.agent.session).totalTokens
   const window = pressure?.contextWindow
@@ -79,7 +79,7 @@ export function contextLines(deps: InsightsDeps, palette: Palette): string[] {
     return rows
   }
   const percent = Math.min(100, used / window * 100)
-  rows.push(`${palette.bold(`~${formatDiagnosticNumber(used)} / ${formatDiagnosticNumber(window)} · ${Math.round(percent)}%`)}`)
+  rows.push(palette.bold(`~${formatDiagnosticNumber(used)} / ${formatDiagnosticNumber(window)} · ${Math.round(percent)}%`))
   rows.push(`${contextMeter(percent, palette)} ${diagnosticMeter(percent, palette)}`)
   if (breakdown !== undefined) {
     const system = breakdown.systemTokens ?? 0
@@ -96,18 +96,26 @@ export function contextLines(deps: InsightsDeps, palette: Palette): string[] {
 }
 
 /** The `/agents` body rows over the subagent descendant list. */
+/** One `/agents` row: a descendant subagent session. */
+interface SubagentEntry {
+  kind: string
+  id: string
+  label?: string
+  mode?: string
+  activity?: string
+  depth?: number
+}
+
 export async function agentsLines(deps: InsightsDeps, signal: AbortSignal): Promise<string[]> {
   const subagents = deps.ctx.get('subagents') as {
-    listDescendants?(rootSessionId: unknown, signal?: AbortSignal): Promise<Array<{
-      kind: string, id: string, label?: string, mode?: string, activity?: string, depth?: number
-    }>>
+    listDescendants?(rootSessionId: unknown, signal?: AbortSignal): Promise<Array<SubagentEntry>>
   } | undefined
   if (subagents?.listDescendants === undefined) {
     return ['Subagents are not available in this session.']
   }
   const entries = await subagents.listDescendants(deps.agent.session.id, signal)
   if (entries.length === 0) return ['No subagent sessions.']
-  return entries.map(entry => {
+  return entries.map((entry) => {
     const status = entry.kind === 'child' ? (entry.activity ?? 'inactive') : 'unavailable'
     const mode = entry.mode === undefined ? '' : ` · ${entry.mode}`
     const depth = entry.depth !== undefined && entry.depth > 0 ? ` · depth ${entry.depth}` : ''
@@ -115,12 +123,18 @@ export async function agentsLines(deps: InsightsDeps, signal: AbortSignal): Prom
   })
 }
 
+/** One `/jobs` row: a background job owned by a session. */
+interface JobSnapshotRow {
+  id: string
+  status: string
+  label?: string
+  ownerSession?: unknown
+}
+
 /** The `/jobs` body rows over the job registry, filtered to this session. */
 export function jobsLines(deps: InsightsDeps): string[] {
   const jobs = deps.ctx.get('jobs') as {
-    list?: (caller?: unknown) => Array<{
-      id: string, status: string, label?: string, ownerSession?: unknown
-    }>
+    list?: (caller?: unknown) => Array<JobSnapshotRow>
   } | undefined
   if (jobs?.list === undefined) return ['Background jobs are not available in this session.']
   const mine = jobs.list(deps.agent).filter(job => job.ownerSession === undefined || job.ownerSession === deps.agent.session.id)
@@ -128,12 +142,18 @@ export function jobsLines(deps: InsightsDeps): string[] {
   return mine.map(job => `${job.status.padEnd(9)} ${job.id.padEnd(12)} ${displayText(job.label ?? '')}`)
 }
 
+/** One `/settings` row: a namespace with its user-override marker. */
+interface SettingsDescriptor {
+  ns: string
+  user?: unknown
+  applies?: boolean
+  revision?: number
+}
+
 /** The `/settings` body rows over the settings registry (secrets redacted). */
 export function settingsLines(deps: InsightsDeps): string[] {
   const settings = deps.ctx.get('settings') as {
-    describe?: (options: { redactSecrets: boolean }) => Array<{
-      ns: string, user?: unknown, applies?: boolean, revision?: number
-    }>
+    describe?: (options: { redactSecrets: boolean }) => Array<SettingsDescriptor>
     documentPath?: () => string | undefined
   } | undefined
   if (settings?.describe === undefined) return ['Settings are not available in this session.']
@@ -181,7 +201,7 @@ export function exportMarkdown(session: Session): string {
         break
       }
       case 'todo/write':
-        lines.push('**Todos**', '', ...(data.todos as Array<{ content: string, status: string }> ?? [])
+        lines.push('**Todos**', '', ...(data.todos as Array<{ content: string; status: string }> ?? [])
           .map(todo => `- [${todo.status === 'completed' ? 'x' : ' '}] ${todo.content}`), '')
         break
       default:

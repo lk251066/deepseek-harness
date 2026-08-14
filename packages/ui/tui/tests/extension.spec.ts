@@ -159,8 +159,8 @@ describe('TuiOverlayManager', () => {
     firstHost?.invalidate()
     expect(firstComponent.invalidated).toBe(1)
     expect(fixture.shown[0]?.component.render(40)).toEqual(['first:40'])
-    fixture.shown[0]!.component.handleInput?.('x')
-    fixture.shown[0]!.component.invalidate()
+    fixture.shown[0].component.handleInput?.('x')
+    fixture.shown[0].component.invalidate()
     expect(firstComponent.inputs).toEqual(['x'])
     expect(firstComponent.invalidated).toBe(2)
     expect(fixture.shown[0]?.component.wantsKeyRelease).toBe(true)
@@ -186,7 +186,7 @@ describe('TuiOverlayManager', () => {
     expect(fixture.shown[1]?.component.wantsKeyRelease).toBe(false)
     expect((fixture.shown[1]?.component as Component & { focused: boolean }).focused).toBe(false)
     ;(fixture.shown[1]?.component as Component & { focused: boolean }).focused = true
-    fixture.shown[1]!.component.handleInput?.('ignored')
+    fixture.shown[1].component.handleInput?.('ignored')
     await second.close()
     await microtask()
 

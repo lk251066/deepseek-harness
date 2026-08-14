@@ -85,7 +85,7 @@ export class GoalActionsDialog implements Component {
       label: action.label,
     }))
     this.list = new SelectList(items, Math.max(1, actions.length), dialogSelectTheme(palette))
-    this.list.onSelect = item => {
+    this.list.onSelect = (item) => {
       const action = actions.find(entry => entry.id === item.value)
       if (action !== undefined) this.run(action)
       this.close()

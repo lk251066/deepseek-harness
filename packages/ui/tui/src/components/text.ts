@@ -35,7 +35,7 @@ export function displayText(text: string): string {
   return text
     .replace(TERMINAL_CONTROL_PATTERN, control =>
       `\\x${control.charCodeAt(0).toString(16).padStart(2, '0')}`)
-    .replace(BARE_URL_PATTERN, match => {
+    .replace(BARE_URL_PATTERN, (match) => {
       let end = match.length
       while (end > 0 && TRAILING_URL_PUNCTUATION.includes(match[end - 1] ?? '')) end -= 1
       const url = match.slice(0, end)

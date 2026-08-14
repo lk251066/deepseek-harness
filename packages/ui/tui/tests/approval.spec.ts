@@ -64,7 +64,7 @@ function ask(result: TuiHarness<FakeTerminal, (code: number) => void>, options: 
       ...options.signal !== undefined ? { signal: options.signal } : {},
     } as never,
     () => Promise.resolve<ApprovalOutcome>('unavailable'),
-  ) as Promise<ApprovalOutcome>
+  )
 }
 
 describe('approval overlay', () => {

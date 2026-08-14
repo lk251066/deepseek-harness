@@ -2002,10 +2002,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     // Pin a cwd free of the substring under test; the prompt context renders the path.
     const result = await setup({ status: 'running', cwd: '/workspace' })
     // Running with nothing queued: the badge is absent and the editor keeps its hint.
-    expect(result.terminal.output).toContain('Assistant')
-    expect(result.terminal.output).toContain('Model wait 0.0s')
     expect(result.terminal.output).toContain('press enter to steer and esc to cancel')
-    expect(result.terminal.output).not.toContain('│')
     expect(result.terminal.output).not.toContain('queued')
 
     result.terminal.output = ''
@@ -2120,7 +2117,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     }))
     // Another agent's dequeue/discard, and ones naming no pending id, leave
     // the badge alone.
-    result.ctx.emit('agent/inbox/dequeue', other, inboxItem(discarded[0]!, 'steering'))
+    result.ctx.emit('agent/inbox/dequeue', other, inboxItem(discarded[0], 'steering'))
     result.ctx.emit('agent/inbox/dequeue', result.agent, inboxItem(freezeMessage({
       id: MessageId('never-queued'),
       role: 'user',
@@ -2146,77 +2143,8 @@ describe('pi-tui chat lifecycle and transcript', () => {
     await dispose(result)
   })
 
-  it('accumulates exclusive timing buckets across a multi-step turn', async () => {
-    let clock = 1_700_000_000_000
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock)
-    const result = await setup({ status: 'running' })
 
-    clock += 1_000
-    result.session.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'block-start', index: 0, blockType: 'reasoning' } })
-    clock += 2_000
-    result.session.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 1, text: 'answering' } })
-    clock += 1_000
-    result.session.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'reasoning-delta', index: 0, text: 'reconsidering' } })
-    clock += 2_000
-    result.session.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 1, text: 'revised' } })
-    clock += 3_000
-    result.session.append('tool/call', { turn: 1, step: 1, callId: 'c1' as never, name: 'bash', arguments: '{}' })
-    clock += 4_000
-    result.session.append('step/end', { turn: 1, step: 1 })
-    result.session.append('step/start', { turn: 1, step: 2 })
-    clock += 1_000
-    result.session.append('assistant/chunk', { turn: 1, step: 2, chunk: { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } } })
-    clock += 2_000
-    result.session.append('assistant/chunk', { turn: 1, step: 2, chunk: { type: 'text-delta', index: 0, text: 'done' } })
-    clock += 3_000
-    result.terminal.output = ''
-    result.session.append('step/end', { turn: 1, step: 2 })
-    await tick()
 
-    expect(result.terminal.output).toContain('Model wait 1.0s · Thinking 4.0s · Response 4.0s · Tools 4.0s')
-    expect(result.terminal.output).toContain('Model wait 1.0s · Response 3.0s · Completed')
-    expect(result.terminal.output).not.toContain('Thinking 0s')
-    nowSpy.mockRestore()
-    await dispose(result)
-  })
-
-  it('rebuilds used subsecond buckets and the durable local completion time', async () => {
-    let clock = new Date(2026, 6, 21, 14, 32, 6).getTime()
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock)
-    let result: Awaited<ReturnType<typeof setup>> | undefined
-    try {
-      result = await setup({
-        beforeMount(session) {
-          clock += 250
-          session.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'fast' } })
-          clock += 500
-          session.append('step/end', { turn: 1, step: 1 })
-          clock += 86_400_000
-        },
-      })
-      const completed = 'Model wait 0.2s · Response 0.5s · Completed 2026-07-21 14:32:06'
-      expect(result.terminal.output).toContain(completed)
-
-      result.terminal.output = ''
-      appendUser(result.session, 'rebuild the transcript')
-      result.terminal.resize(result.terminal.columns + 1)
-      await tick()
-      expect(result.terminal.output).toContain(completed)
-    } finally {
-      if (result !== undefined) await dispose(result)
-      nowSpy.mockRestore()
-    }
-  })
-
-  it('renders completion for a step whose opening event is unavailable', async () => {
-    const result = await setup({ omitInitialLifecycle: true })
-    result.session.append('step/end', { turn: 1, step: 1 })
-    await tick()
-    expect(result.terminal.output).toContain('Completed ')
-    expect(result.terminal.output).toContain('Assistant')
-    expect(result.terminal.output).toContain('Model wait 0.0s · Completed')
-    await dispose(result)
-  })
 
   it('does not reuse a completed turn before the next turn starts', async () => {
     let clock = 1_700_000_000_000
@@ -2236,10 +2164,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
       result.terminal.output = ''
       result.ctx.emit('agent/status', result.agent, 'running')
       await tick()
-      expect(result.terminal.output).not.toContain('Model wait')
       expect(result.terminal.output).toContain('press enter to steer and esc to cancel')
-      expect(result.terminal.output).not.toContain('│')
-      expect(result.terminal.output).not.toContain('Response 1s')
 
       result.session.append('turn/start', { turn: 2 })
       result.session.append('step/start', { turn: 2, step: 1 })
@@ -2247,8 +2172,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
       result.terminal.output = ''
       result.session.append('assistant/chunk', { turn: 2, step: 1, chunk: { type: 'text-delta', index: 0, text: 'next' } })
       await tick()
-      expect(result.terminal.output).toContain('Model wait 1.0s')
-      expect(result.terminal.output).not.toContain('Model wait 3.0s')
+      expect(result.terminal.output).toContain('next')
     } finally {
       if (result !== undefined) await dispose(result)
       nowSpy.mockRestore()
@@ -2644,91 +2568,9 @@ describe('pi-tui chat lifecycle and transcript', () => {
     await dispose(result)
   })
 
-  it('refreshes the running turn timing on its own timer', async () => {
-    let now = 1_700_000_000_000
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
-    const intervals = vi.spyOn(globalThis, 'setInterval')
-    let result: Awaited<ReturnType<typeof setup>> | undefined
-    try {
-      result = await setup({ status: 'running', now: () => now })
-      // The running prompt animates at ~20 fps (50 ms); the same tick keeps the
-      // elapsed timing text current, so no separate timing-only timer exists.
-      const refresh = intervals.mock.calls.find(([, interval]) => interval === 50)?.[0]
-      if (typeof refresh !== 'function') throw new Error('TUI did not register its running-status refresh interval')
-      result.terminal.output = ''
-      now += 1_000
-      refresh()
-      await tick()
-      expect(result.terminal.output).toContain('Model wait 1.0s')
-    } finally {
-      if (result !== undefined) await dispose(result)
-      intervals.mockRestore()
-      nowSpy.mockRestore()
-    }
-  })
 
-  it('shows minutes and seconds in accumulated timing', async () => {
-    let clock = 1_700_000_000_000
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock)
-    const result = await setup({ status: 'running' })
-    clock += 95_000
-    result.terminal.output = ''
-    result.session.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'hi' } })
-    await tick()
-    expect(result.terminal.output).toContain('Model wait 1m35.0s')
-    nowSpy.mockRestore()
-    await dispose(result)
-  })
 
-  it('trails the completed step timing below the step tool cards, not above them', async () => {
-    const clock = new Date(2026, 6, 21, 12, 0, 0).getTime()
-    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(clock)
-    const result = await setup({ status: 'running' })
-    // A step whose assistant message drives a tool call: the tool card is
-    // appended after the assistant text, so the timing footer must follow the
-    // tool output rather than sit above it (its first message).
-    appendAssistant(result.session, [
-      { type: 'text', text: 'Running a command' },
-      { type: 'tool-call', id: 'c1' as never, name: 'bash', arguments: '{}' },
-    ])
-    result.session.append('tool/call', { turn: 1, step: 1, callId: 'c1' as never, name: 'bash', arguments: '{}' })
-    result.session.append('tool/result', {
-      turn: 1, step: 1,
-      message: createToolResultMessage({
-        callId: 'c1' as never,
-        content: [{ type: 'text', text: 'command output' }],
-        isError: false,
-      }),
-    }, { surfaceOp: 'append' })
-    result.terminal.output = ''
-    result.session.append('step/end', { turn: 1, step: 1 })
-    await tick()
 
-    const frame = result.terminal.output
-    const toolAt = frame.indexOf('command output')
-    const timingAt = frame.indexOf('Completed 2026-07-21 12:00:00')
-    expect(toolAt).toBeGreaterThanOrEqual(0)
-    expect(timingAt).toBeGreaterThan(toolAt)
-    nowSpy.mockRestore()
-    await dispose(result)
-  })
-
-  it('preserves accumulated timing across a mid-turn color-scheme change', async () => {
-    let clock = 1_700_000_000_000
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock)
-    const result = await setup({ status: 'running' })
-    clock += 1_000
-    result.session.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'answering' } })
-    clock += 4_000
-    result.terminal.output = ''
-    result.terminal.send('\x1b[?997;2n')
-    await tick()
-    await tick()
-    expect(result.terminal.output).toContain('Model wait 1.0s · Response 4.0s')
-
-    nowSpy.mockRestore()
-    await dispose(result)
-  })
 
   it('renders the ANSI palette and every markdown/content style', async () => {
     const result = await setup({
@@ -2769,10 +2611,14 @@ describe('pi-tui chat lifecycle and transcript', () => {
     expect(result.terminal.output).toContain('nested result')
     expect(result.terminal.output).toContain('[future-block]')
     expect(result.terminal.output).toContain('[content]')
-    // Fenced code renders through the syntax highlighter: keywords take the
-    // accent role and numbers the warning role rather than one flat code color.
+    // User input echoes as plain text (Claude Code `>` quote in the accent
+    // color): the markdown source shows verbatim, fences included.
+    expect(result.terminal.output).toMatch(/\x1b\[95m> \x1b\[39m# Heading/)
+    expect(result.terminal.output).toContain('```ts')
+    // Assistant fenced code renders through the syntax highlighter: keywords
+    // take the accent role and numbers the warning role rather than one flat
+    // code color.
     expect(result.terminal.output).toContain('\x1b[95mconst\x1b[39m answer = \x1b[33m42\x1b[39m')
-    expect(result.terminal.output).not.toContain('```')
     expect(result.terminal.output).toContain('↑2.0m ↓1.5m')
     await dispose(result)
   })
@@ -3230,7 +3076,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     // the allow decision), not a separate pre-admission inject.
     expect(result.agent.injected).toHaveLength(0)
     const decision = await agentEvents(result.ctx, result.agent).waterfall(
-      'agent/prompt-submit', result.agent.sentMessages[0]!,
+      'agent/prompt-submit', result.agent.sentMessages[0],
       new AbortController().signal, () => Promise.resolve({ kind: 'allow' as const }),
     )
     expect(decision.kind).toBe('allow')
@@ -3240,7 +3086,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     // The one-shot wrapper detached itself at admission: replaying the
     // waterfall attaches nothing a second time.
     const replay = await agentEvents(result.ctx, result.agent).waterfall(
-      'agent/prompt-submit', result.agent.sentMessages[0]!,
+      'agent/prompt-submit', result.agent.sentMessages[0],
       new AbortController().signal, () => Promise.resolve({ kind: 'allow' as const }),
     )
     expect(replay.kind === 'allow' && replay.additionalContexts).toBeUndefined()
@@ -3287,7 +3133,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     expect(result.agent.steered).toHaveLength(0)
     expect(result.agent.injected).toHaveLength(0)
     const decision = await agentEvents(result.ctx, result.agent).waterfall(
-      'agent/prompt-submit', result.agent.sentMessages[0]!,
+      'agent/prompt-submit', result.agent.sentMessages[0],
       new AbortController().signal, () => Promise.resolve({ kind: 'allow' as const }),
     )
     expect(decision.kind === 'allow' && decision.additionalContexts?.[0]?.source)
@@ -3329,7 +3175,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     // no armed listener, and an unrelated admission is untouched. The leak
     // regression: a listener installed after its cleanup already ran would
     // survive every future cleanup.
-    result.ctx.emit('agent/inbox/discard', result.agent, [inboxItem(result.agent.sentMessages[0]!, 'queued')])
+    result.ctx.emit('agent/inbox/discard', result.agent, [inboxItem(result.agent.sentMessages[0], 'queued')])
     const unrelated = await agentEvents(result.ctx, result.agent).waterfall(
       'agent/prompt-submit', createUserMessage({
         content: [{ type: 'text', text: 'unrelated' }],
@@ -3390,7 +3236,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     // returned the existing id: replaying the prompt's admission attaches no
     // stranded snapshot, and nothing leaks for the TUI lifetime.
     const replay = await agentEvents(result.ctx, result.agent).waterfall(
-      'agent/prompt-submit', result.agent.sentMessages[0]!,
+      'agent/prompt-submit', result.agent.sentMessages[0],
       new AbortController().signal, () => Promise.resolve({ kind: 'allow' as const }),
     )
     expect(replay.kind === 'allow' && replay.additionalContexts).toBeUndefined()
@@ -3421,7 +3267,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
     await vi.waitFor(() => { expect(result.agent.sent).toHaveLength(1) })
 
     const blocked = await agentEvents(result.ctx, result.agent).waterfall(
-      'agent/prompt-submit', result.agent.sentMessages[0]!,
+      'agent/prompt-submit', result.agent.sentMessages[0],
       new AbortController().signal, () => Promise.resolve({ kind: 'allow' as const }),
     )
     expect(blocked.kind).toBe('block')
@@ -3623,7 +3469,7 @@ describe('pi-tui chat lifecycle and transcript', () => {
       { type: 'text', text: '@evil\\x1b\\x07\\x9b\\x0as' },
     ]])
     const decision = await agentEvents(result.ctx, result.agent).waterfall(
-      'agent/prompt-submit', result.agent.sentMessages[0]!,
+      'agent/prompt-submit', result.agent.sentMessages[0],
       new AbortController().signal, () => Promise.resolve({ kind: 'allow' as const }),
     )
     expect(decision.kind === 'allow' && decision.additionalContexts?.[0]?.source)
@@ -5596,7 +5442,7 @@ describe('tool cards and surface replay', () => {
       content: [{ type: 'text', text: '<context_checkpoint>model-only summary payload</context_checkpoint>' }],
       source: compactCheckpointSource(CompactionId('test-compaction')),
     }), {
-      surfaceOp: { op: 'replace', start: nodes[0] as number, end: nodes.at(-1) as number },
+      surfaceOp: { op: 'replace', start: nodes[0], end: nodes.at(-1) as number },
       sourceEventSeqs: nodes,
     })
     // A regenerated assistant message replaces one node without summarizing
@@ -5675,7 +5521,7 @@ describe('tool cards and surface replay', () => {
           content: [{ type: 'text', text: '<context_checkpoint>stored model-only payload</context_checkpoint>' }],
           source: compactCheckpointSource(CompactionId('test-compaction')),
         }), {
-          surfaceOp: { op: 'replace', start: nodes[0] as number, end: nodes.at(-1) as number },
+          surfaceOp: { op: 'replace', start: nodes[0], end: nodes.at(-1) as number },
           sourceEventSeqs: nodes,
         })
       },
@@ -5696,9 +5542,6 @@ describe('tool cards and surface replay', () => {
     .slice(terminal.output.lastIndexOf('\x1b[2J'))
     .replaceAll(/\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07|\r/g, '')
 
-  const countAssistantHeaders = (frame: string): number => frame.split('\n')
-    .filter(row => row.trim() === 'Assistant').length
-
   /** One turn with text -> tool call/result -> text across two steps. */
   const appendTwoStepTurn = (session: Awaited<ReturnType<typeof setup>>['session']): void => {
     appendUser(session, 'fold me')
@@ -5717,15 +5560,15 @@ describe('tool cards and surface replay', () => {
     session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
   }
 
-  it('folds a turn to one Assistant header in hidden mode and restores headers on cycle', async () => {
+  it('drops tool cards in hidden mode and restores them on cycle', async () => {
     const result = await setup({ tools })
     appendTwoStepTurn(result.session)
     await tick()
 
-    // Collapsed (default): each step keeps its own header.
+    // Collapsed (default): the tool card previews.
     result.terminal.send('\x0c')
     await tick()
-    expect(countAssistantHeaders(lastFrame(result.terminal))).toBe(2)
+    expect(lastFrame(result.terminal)).toContain('Run command')
 
     // collapsed -> expanded -> hidden.
     result.terminal.send('\x0f')
@@ -5734,19 +5577,18 @@ describe('tool cards and surface replay', () => {
     result.terminal.send('\x0c')
     await tick()
     const hidden = lastFrame(result.terminal)
-    expect(countAssistantHeaders(hidden)).toBe(1)
     expect(hidden).toContain('first step text')
     expect(hidden).toContain('second step text')
-    expect(hidden).not.toContain('Tool / bash')
-    // The fold keeps model order: header text precedes the continuation.
+    expect(hidden).not.toContain('Run command')
+    // Model order survives the fold.
     expect(hidden.indexOf('first step text')).toBeLessThan(hidden.indexOf('second step text'))
 
-    // hidden -> collapsed restores per-step headers.
+    // hidden -> collapsed brings the cards back.
     result.terminal.send('\x0f')
     await tick()
     result.terminal.send('\x0c')
     await tick()
-    expect(countAssistantHeaders(lastFrame(result.terminal))).toBe(2)
+    expect(lastFrame(result.terminal)).toContain('Run command')
     await dispose(result)
   })
 
@@ -5782,14 +5624,11 @@ describe('tool cards and surface replay', () => {
     result.terminal.send('\x0c')
     await tick()
     const hidden = lastFrame(result.terminal)
-    // One header per turn: the tool-only step neither renders a blank segment
-    // nor consumes turn one's header, which the late text step owns.
-    expect(countAssistantHeaders(hidden)).toBe(2)
+    // The tool-only step neither renders a blank segment nor crowds out the
+    // late text step; turn two stays separate.
+    expect(hidden).not.toContain('tool body')
     expect(hidden).toContain('late turn-one text')
     expect(hidden).toContain('turn-two text')
-    const rows = hidden.split('\n').map(row => row.trim())
-    const turnOneHeader = rows.indexOf('Assistant')
-    expect(rows[turnOneHeader + 1]).toBe('late turn-one text')
     await dispose(result)
   })
 
@@ -5806,7 +5645,6 @@ describe('tool cards and surface replay', () => {
     result.terminal.send('\x0c')
     await tick()
     const hidden = lastFrame(result.terminal)
-    expect(countAssistantHeaders(hidden)).toBe(1)
     expect(hidden).toContain('live first')
     expect(hidden).toContain('live second')
 
@@ -5814,7 +5652,6 @@ describe('tool cards and surface replay', () => {
     result.terminal.resize(89)
     await tick()
     const rebuilt = lastFrame(result.terminal)
-    expect(countAssistantHeaders(rebuilt)).toBe(1)
     expect(rebuilt).toContain('live second')
     await dispose(result)
   })
@@ -6578,7 +6415,7 @@ describe('TUI extension service', () => {
       questions: [{ id: 'after-plugin', question: 'Question after plugins?', options: [{ label: 'Yes' }] }],
     })
     result.terminal.send('f')
-    await expect(sessions[0]!.closed).resolves.toEqual({ reason: 'closed' })
+    await expect(sessions[0].closed).resolves.toEqual({ reason: 'closed' })
     await vi.waitFor(() => {
       expect(result.terminal.output).toContain('second plugin overlay')
     })
@@ -6586,7 +6423,7 @@ describe('TUI extension service', () => {
     expect(sessions[1]?.state).toBe('active')
 
     result.terminal.send('s')
-    await expect(sessions[1]!.closed).resolves.toEqual({ reason: 'closed' })
+    await expect(sessions[1].closed).resolves.toEqual({ reason: 'closed' })
     await vi.waitFor(() => {
       expect(result.terminal.output).toContain('Question after plugins?')
     })
@@ -6625,7 +6462,7 @@ describe('TUI extension service', () => {
     })
 
     await result.controller.dispose()
-    await expect(sessions[0]!.closed).resolves.toEqual({ reason: 'owner-disposed' })
+    await expect(sessions[0].closed).resolves.toEqual({ reason: 'owner-disposed' })
     expect(signals[0]?.aborted).toBe(true)
     expect(result.ctx.get('tui')).toBeUndefined()
 
@@ -7091,19 +6928,19 @@ describe('banner sweep reveal', () => {
     while (!done() && Date.now() < deadline) await tick()
     intervals.mockRestore()
     cleared.mockRestore()
-    // The finished banner carries the title and the model • session detail.
+    // The finished banner carries the title; the session id no longer has
+    // its own banner row, and the banner itself stays borderless (the
+    // rounded frame below belongs to the input box).
     expect(result.terminal.output).toContain('DEEPSEEK')
     expect(result.terminal.output).toContain('HARNESS')
-    expect(result.terminal.output).toContain('main-session')
-    // Borderless: no box-drawing frame around the banner.
-    expect(result.terminal.output).not.toContain('╭')
-    expect(result.terminal.output).not.toContain('╮')
-    // A mid-sweep frame rendered a clipped title: `DEEPSEEK` with no `HARNESS`
-    // on the same line.
-    const clipped = result.terminal.output
-      .split('\n')
-      .some(line => line.includes('DEEPSEEK') && !line.includes('HARNESS'))
-    expect(clipped).toBe(true)
+    const bannerLine = result.terminal.output.split('\n').find(line => line.includes('DEEPSEEK'))
+    expect(bannerLine).toBeDefined()
+    expect(bannerLine).not.toContain('╭')
+    // A mid-sweep frame rendered a clipped title (`DEEPSEEK H…` short of the
+    // full `HARNESS`). The one-line banner repaints in place, so the clipped
+    // frame may sit mid-stream between escape sequences rather than on its
+    // own line — match the raw output.
+    expect(/DEEPSEEK H(?!ARNESS)/.test(result.terminal.output)).toBe(true)
     await dispose(result)
   })
 
@@ -7112,7 +6949,8 @@ describe('banner sweep reveal', () => {
     await tick()
     expect(result.terminal.output).toContain('Coding agent ready.')
     expect(result.terminal.output).toContain('DEEPSEEK')
-    expect(result.terminal.output).not.toContain('╭')
+    const bannerLine = result.terminal.output.split('\n').find(line => line.includes('DEEPSEEK'))
+    expect(bannerLine).not.toContain('╭')
     // No reveal frames: the banner is drawn whole from the first render, so no
     // clipped-title frame ever appears.
     const clipped = result.terminal.output
@@ -7125,10 +6963,11 @@ describe('banner sweep reveal', () => {
   it('omits the subtitle line entirely when no welcome is configured', async () => {
     const result = await setup({ omitWelcome: true })
     const deadline = Date.now() + 5000
-    while (!result.terminal.output.includes('main-session') && Date.now() < deadline) await tick()
-    // Banner is title + detail only — no subtitle between them.
+    while (!result.terminal.output.includes('HARNESS') && Date.now() < deadline) await tick()
+    // Banner is the title alone — no subtitle line, no session-id row.
     expect(result.terminal.output).toContain('deepseek-v4-flash')
     expect(result.terminal.output).not.toContain('ready.')
+    expect(result.terminal.output).not.toContain('main-session')
     await dispose(result)
   })
 

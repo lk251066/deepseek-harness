@@ -92,7 +92,7 @@ export function createGoalBar(deps: GoalBarDeps): GoalBarController {
           current.objective,
           actions,
           deps.palette,
-          action => {
+          (action) => {
             try {
               if (action.id === 'pause') goals.pause(agent, ref)
               else if (action.id === 'resume') goals.resume(agent, ref)

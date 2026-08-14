@@ -58,7 +58,7 @@ export function createQueueDock(deps: QueueDockDeps): QueueDockController {
     // Test/embedder agents may not carry the inbox projection; an absent
     // inbox renders an empty dock rather than throwing on every refresh.
     const inbox = (agent as {
-      inbox?: { readonly nextStep: readonly UserMessage[], readonly nextTurn: readonly UserMessage[] }
+      inbox?: { readonly nextStep: readonly UserMessage[]; readonly nextTurn: readonly UserMessage[] }
     }).inbox
     if (inbox === undefined) return []
     return [
@@ -79,7 +79,7 @@ export function createQueueDock(deps: QueueDockDeps): QueueDockController {
         create: () => new QueueDialog(
           current,
           deps.palette,
-          entry => {
+          (entry) => {
             const message = [...agent.inbox.nextStep, ...agent.inbox.nextTurn]
               .find(candidate => candidate.id === entry.id)
             if (message === undefined) {
@@ -89,7 +89,7 @@ export function createQueueDock(deps: QueueDockDeps): QueueDockController {
             editTarget = message
             deps.loadIntoEditor(contentText(message.content))
           },
-          entry => {
+          (entry) => {
             try {
               agent.inbox.remove(entry.id as MessageId)
               deps.appendNotice('Queued message removed.')

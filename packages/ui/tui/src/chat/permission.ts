@@ -13,7 +13,7 @@ import type { ChannelNotice, ChatChannelDeps } from './channel.ts'
 export interface PermissionPresetsService {
   readonly names: readonly string[]
   current(events: readonly unknown[]): string
-  resolve(name: string): { sandbox: string, approval?: string, description?: string }
+  resolve(name: string): { sandbox: string; approval?: string; description?: string }
   set(session: unknown, name: string): unknown
 }
 
@@ -41,7 +41,7 @@ export interface PermissionController {
 export function createPermissionController(deps: PermissionDeps): PermissionController {
   const { ctx, agent } = deps
   const presets = (): PermissionPresetsService | undefined =>
-    ctx.get('permissionPresets') as PermissionPresetsService | undefined
+    ctx.get('permissionPresets')
 
   const apply = (name: string): void => {
     const service = presets()
@@ -72,7 +72,7 @@ export function createPermissionController(deps: PermissionDeps): PermissionCont
       if (spec.sandbox === 'danger-full-access') {
         deps.confirmRisk(
           'danger-full-access disables the sandbox AND approval prompts — the agent can run any command and edit any file.',
-          confirmed => { if (confirmed) apply(next) },
+          (confirmed) => { if (confirmed) apply(next) },
         )
         return
       }

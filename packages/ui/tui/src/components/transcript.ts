@@ -1,7 +1,7 @@
 /**
  * pi-tui transcript components: the startup banner, user/assistant messages,
- * per-step timing footer, streaming assistant buffer, tool cards, and the todo
- * panel. Each is a pure function of its inputs and the active palette.
+ * the streaming assistant buffer, tool cards, and the todo panel. Each is a
+ * pure function of its inputs and the active palette.
  * @module @deepseek-ai/dsh-tui/components/transcript
  */
 
@@ -17,7 +17,6 @@ import {
   type MarkdownTheme,
 } from '@earendil-works/pi-tui'
 import { diffLines as compareLines } from 'diff'
-import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { JsonValue, SessionEvent, TodoItem } from '@deepseek-ai/dsh-session'
 import type {
@@ -33,11 +32,8 @@ import { gradientText, type Palette } from './theme.ts'
 import { contentText, type ParsedArguments } from './content.ts'
 import { progressiveTitle, settledTitle } from '../chat/tool-verbs.ts'
 import {
-  formatCompletionTime,
   formatStatusDuration,
-  formatTimingTotals,
   type StepPosition,
-  type StepTimingTracker,
 } from '../chat/timing.ts'
 
 /** Concatenate the text of every block of one type, separated by blank lines. */
@@ -124,25 +120,20 @@ function renderDiff(
 }
 
 /**
- * A message's bold, underlined role header in the role color. The underline
- * bands each role without a background fill or per-line prefix, so it reads on
- * any theme and a body drag-select copies the message text verbatim.
+ * Prefix marker for echoed user input (the Claude Code `>` quote convention).
  */
-function messageHeader(label: string, color: (text: string) => string, palette: Palette): string {
-  return palette.bold(palette.underline(color(displayText(label))))
-}
+const USER_PROMPT_MARKER = '> '
 
 /**
- * Borderless startup banner: product title, an optional configured subtitle,
- * and the session id. No box frame — each line renders as plain left-padded
- * text (matching transcript notices) so it reads on any theme.
+ * Borderless startup banner: the product title and an optional configured
+ * subtitle on one compact line. No box frame and no session-id row — the
+ * banner names the product and gets out of the way.
  */
 export class HeaderComponent implements Component {
   /** Columns of the banner currently revealed; `undefined` renders it whole. */
   private revealWidth: number | undefined
 
   constructor(
-    private readonly agent: Agent,
     private readonly subtitle: () => string | undefined,
     private readonly palette: Palette,
     private readonly gradient: boolean,
@@ -164,18 +155,14 @@ export class HeaderComponent implements Component {
       ? this.palette.bold(gradientText('DEEPSEEK'))
       : this.palette.bold(this.palette.accent('DEEPSEEK'))
     const title = `${name} ${this.palette.bold('HARNESS')}`
-    const detail = displayText(this.agent.session.id)
     const subtitle = this.subtitle()
-    const lines = [
-      title,
-      ...subtitle === undefined ? [] : [this.palette.dim(displayText(subtitle))],
-      this.palette.dim(detail),
-    ]
-      .flatMap(line => wrapTextWithAnsi(line, usable))
-      .map(line => ` ${truncateToWidth(line, usable, '')}`)
+    const line = subtitle === undefined
+      ? title
+      : `${title} ${this.palette.dim(displayText(subtitle))}`
+    const lines = wrapTextWithAnsi(line, usable).map(wrapped => ` ${truncateToWidth(wrapped, usable, '')}`)
     if (this.revealWidth === undefined) return lines
     const revealed = this.revealWidth
-    return lines.map(line => truncateToWidth(line, revealed, ''))
+    return lines.map(wrapped => truncateToWidth(wrapped, revealed, ''))
   }
 }
 
@@ -193,7 +180,7 @@ export class ImageBlockComponent extends Container {
   ) {
     super()
     this.addChild(new Text(palette.dim(`[loading image ${displayText(attachmentId)}]`), 0, 0))
-    void load(attachmentId).then(data => {
+    void load(attachmentId).then((data) => {
       this.clear()
       if (data === undefined) {
         this.addChild(new Text(palette.dim(`[image ${displayText(attachmentId)} unavailable]`), 0, 0))
@@ -215,26 +202,25 @@ export class ImageBlockComponent extends Container {
 }
 
 /**
- * A user or steering prompt in the transcript. An underlined accent role header
- * plus blank-line spacing separate it from surrounding blocks; body lines carry
- * no prefix or indent, so a terminal drag-select copies the prompt verbatim.
- * Image blocks render inline beneath the text through {@link ImageBlockComponent}.
+ * A user or steering prompt in the transcript. Every body line carries the
+ * Claude Code `>` quote marker in the accent color and the text renders as
+ * plain echo (no markdown styling, the way Claude Code quotes input back), so
+ * a terminal drag-select copies the prompt verbatim. Image blocks render
+ * inline beneath the text through {@link ImageBlockComponent}.
  */
 export class UserMessageComponent extends Container {
   constructor(
     text: string,
     palette: Palette,
-    mdTheme: MarkdownTheme,
-    label = 'You',
-    images: readonly { attachmentId: string, mediaType: string }[] = [],
+    images: readonly { attachmentId: string; mediaType: string }[] = [],
     loadImage?: (attachmentId: string) => Promise<Uint8Array | undefined>,
   ) {
     super()
-    this.addChild(new Text(messageHeader(label, palette.accent, palette), 0, 0))
-    this.addChild(new Markdown(displayText(text), 0, 0, mdTheme, { color: value => palette.text(value) }, {
-      preserveOrderedListMarkers: true,
-      preserveBackslashEscapes: true,
-    }))
+    // Every source line carries the marker; wrap continuation lines flow
+    // flush-left (Text re-wraps per render width).
+    const marker = palette.accent(USER_PROMPT_MARKER)
+    const lines = displayText(text).split('\n').map(line => `${marker}${line}`)
+    this.addChild(new Text(lines.join('\n'), 0, 0))
     const loader: (attachmentId: string) => Promise<Uint8Array | undefined>
       = loadImage === undefined ? () => Promise.resolve(undefined) : loadImage
     for (const image of images) {
@@ -250,9 +236,10 @@ export class UserMessageComponent extends Container {
 
 /**
  * Children of a settled assistant message: optional reasoning block then the
- * response text. A folded continuation (a later step of a turn while tool cards
- * are hidden) drops the `Assistant` header and renders nothing when it has no
- * visible body, so tool-only steps leave no blank segment behind.
+ * response text. Assistant prose carries no role header (the Claude Code
+ * convention — tool cards and markers already band the message), and a folded
+ * continuation with no visible body renders nothing at all, so tool-only
+ * steps leave no blank segment behind.
  */
 function assistantMessageChildren(
   content: readonly ContentBlock[],
@@ -266,9 +253,6 @@ function assistantMessageChildren(
   const showsReasoning = reasoning !== '' && showReasoning
   if (foldedContinuation && !showsReasoning && text === '') return []
   const children: Component[] = [new Spacer(1)]
-  if (!foldedContinuation) {
-    children.push(new Text(messageHeader('Assistant', palette.accent, palette), 0, 0))
-  }
   if (showsReasoning) {
     children.push(
       new Text(palette.italic(palette.dim('Reasoning')), 0, 0),
@@ -279,45 +263,6 @@ function assistantMessageChildren(
   return children
 }
 
-/**
- * A step's timing summary, rendered as a self-refreshing footer that stays at
- * the tail of the step's output. Kept separate from the assistant message so
- * the timing line trails any tool cards the step appends after its message.
- */
-class StepTimingComponent extends Container {
-  private completionTime: number | undefined
-
-  constructor(
-    private readonly position: StepPosition,
-    private readonly events: () => readonly SessionEvent[],
-    private readonly tracker: StepTimingTracker,
-    private readonly now: () => number,
-    private readonly palette: Palette,
-  ) {
-    super()
-    this.rebuild()
-  }
-
-  complete(time: number): void {
-    this.completionTime = time
-    this.rebuild()
-  }
-
-  override invalidate(): void {
-    this.rebuild()
-    super.invalidate()
-  }
-
-  private rebuild(): void {
-    this.clear()
-    const totals = this.tracker.totalsAt(this.events(), this.position, this.completionTime ?? this.now())
-    const timing = formatTimingTotals(totals, true)
-    const header = this.completionTime === undefined
-      ? timing
-      : `${timing} · Completed ${formatCompletionTime(this.completionTime)}`
-    this.addChild(new Text(this.palette.dim(header), 0, 0))
-  }
-}
 
 interface StreamingBlock {
   type: string
@@ -329,25 +274,14 @@ export class StreamingAssistantComponent extends Container {
   private readonly blocks = new Map<number, StreamingBlock>()
   private settledContent: readonly ContentBlock[] | undefined
   private foldedContinuation = false
-  /**
-   * The step's timing footer. The renderer keeps it at the tail of the chat so
-   * it trails any tool cards the step appends after this assistant message; it
-   * is not a child of this component.
-   */
-  readonly timing: StepTimingComponent
-
   constructor(
-    /** The step's turn/step coordinates, used to group steps into their turn. */
+    /** The step's turn/step coordinates, used to group steps into its turn. */
     readonly position: StepPosition,
-    events: () => readonly SessionEvent[],
-    tracker: StepTimingTracker,
-    now: () => number,
     private showReasoning: boolean,
     private readonly palette: Palette,
     private readonly mdTheme: MarkdownTheme,
   ) {
     super()
-    this.timing = new StepTimingComponent(position, events, tracker, now, palette)
     this.rebuild()
   }
 
@@ -368,17 +302,8 @@ export class StreamingAssistantComponent extends Container {
     return this.settledContent !== undefined
   }
 
-  /**
-   * Pin the step's timing footer to its completion time.
-   * @param time - Step completion time in epoch milliseconds.
-   */
-  complete(time: number): void {
-    this.timing.complete(time)
-  }
-
   override invalidate(): void {
     this.rebuild()
-    this.timing.invalidate()
     super.invalidate()
   }
 
@@ -398,7 +323,6 @@ export class StreamingAssistantComponent extends Container {
       this.blocks.set(chunk.index, { type: chunk.block.type, text: chunk.block.text })
     }
     this.rebuild()
-    this.timing.invalidate()
   }
 
   /**
@@ -484,7 +408,7 @@ const RESULT_CONTINUATION = '    '
  */
 function prefixResultLines(body: readonly string[]): string[] {
   let marked = false
-  return body.map(line => {
+  return body.map((line) => {
     if (line === '') return ''
     if (!marked) {
       marked = true
@@ -548,7 +472,7 @@ export class ToolCardComponent extends CachedCardComponent {
     private readonly palette: Palette,
     private readonly mdTheme: MarkdownTheme,
     /** Wall-clock time of the `tool/call` event, for the settled duration. */
-    private readonly startedAt: number | undefined = undefined,
+    private readonly startedAt?: number  ,
   ) {
     super()
     this.callView = this.presentCall()
@@ -719,10 +643,10 @@ export class ToolCardComponent extends CachedCardComponent {
    * pending one — e.g. a terminal result carries the output but not the
    * command, which lives in the call view's title).
    */
-  private mergedView(): { card: string, title?: string, description?: string } {
-    const call = this.callView as { card: string, title?: string, description?: string }
+  private mergedView(): { card: string; title?: string; description?: string } {
+    const call = this.callView as { card: string; title?: string; description?: string }
     if (this.resultView === undefined) return call
-    const result = this.resultView as { card: string, title?: string, description?: string }
+    const result = this.resultView as { card: string; title?: string; description?: string }
     const title = result.title ?? call.title
     const description = result.description ?? call.description
     return {

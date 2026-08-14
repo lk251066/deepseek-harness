@@ -110,7 +110,7 @@ function renderRows(rows: readonly RowSnapshot[], firstRow: number): string[] {
   }
   for (let index = 0; index < rows.length; index++) {
     const absoluteRow = firstRow + index
-    const row = rows[index] as RowSnapshot
+    const row = rows[index]
     if (row.text === '' && row.styles.length === 0 && !row.wrapped) {
       blankStart ??= absoluteRow
       continue

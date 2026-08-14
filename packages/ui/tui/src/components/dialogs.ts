@@ -421,7 +421,7 @@ export class ModelDialog implements Component {
       this.refreshing = true
       this.invalidate()
       void this.onRefresh().then(
-        choices => {
+        (choices) => {
           this.refreshing = false
           this.rebuildItems(choices, this.selection)
           this.list = this.buildList(this.currentValue)
@@ -606,7 +606,7 @@ export class RenameDialog implements Component {
     private readonly close: () => void,
   ) {
     this.input.setValue(initial)
-    this.input.onSubmit = value => {
+    this.input.onSubmit = (value) => {
       const title = value.trim()
       if (title === '') {
         this.error = 'A session title cannot be empty.'
@@ -663,7 +663,7 @@ export class ConfirmDialog implements Component {
       { value: 'cancel', label: 'Cancel', description: 'keep the current setting' },
     ]
     this.list = new SelectList(items, 2, dialogSelectTheme(palette))
-    this.list.onSelect = item => {
+    this.list.onSelect = (item) => {
       this.choose(item.value === 'confirm')
       this.close()
     }
@@ -729,7 +729,7 @@ export class ApprovalDialog implements Component {
     ]
     this.list = new SelectList(items, items.length, dialogSelectTheme(palette))
     this.list.setSelectedIndex(0)
-    this.list.onSelect = item => {
+    this.list.onSelect = (item) => {
       this.choose(item.value as ApprovalChoice)
       this.close()
     }
@@ -801,7 +801,7 @@ export class ThemeDialog implements Component {
     this.list = new SelectList(items, Math.max(1, choices.length), dialogSelectTheme(palette))
     const index = items.findIndex(item => item.value === current)
     this.list.setSelectedIndex(Math.max(0, index))
-    this.list.onSelect = item => {
+    this.list.onSelect = (item) => {
       this.apply(item.value)
       this.close()
     }

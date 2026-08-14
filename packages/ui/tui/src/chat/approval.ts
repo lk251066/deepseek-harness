@@ -69,7 +69,7 @@ export function createApprovalAnswerer(deps: ApprovalAnswererDeps): ApprovalAnsw
   }
 
   /** The next-more-permissive preset name, when presets exist and one does. */
-  const escalateTarget = (): { name: string, label: string } | undefined => {
+  const escalateTarget = (): { name: string; label: string } | undefined => {
     // Optional service: embedder bundles may mount the TUI without presets.
     const presets = ctx.get('permissionPresets') as {
       names(): readonly string[]
@@ -115,7 +115,7 @@ export function createApprovalAnswerer(deps: ApprovalAnswererDeps): ApprovalAnsw
         deps.pendingCallLabel(request.callId),
         target?.label,
         palette,
-        choice => {
+        (choice) => {
           if (choice === 'escalate' && target !== undefined) escalate(target.name)
           settle(pending, choice === 'reject' ? 'rejected' : 'allowed-once')
           showNext()
@@ -128,7 +128,7 @@ export function createApprovalAnswerer(deps: ApprovalAnswererDeps): ApprovalAnsw
       },
     }, 'inline')
     pending.overlay = session
-    void session.closed.then(result => {
+    void session.closed.then((result) => {
       if (pending.overlay !== session) return
       pending.overlay = undefined
       // An overlay that died without a choice (owner disposed, render error)
@@ -141,7 +141,7 @@ export function createApprovalAnswerer(deps: ApprovalAnswererDeps): ApprovalAnsw
 
   const removeListener = ctx.on('approval/request', (request: ApprovalRequest, next) => {
     if (request.agent !== agent) return next()
-    return new Promise<ApprovalOutcome>(resolveOutcome => {
+    return new Promise<ApprovalOutcome>((resolveOutcome) => {
       const pending: PendingApproval = {
         request,
         resolve: resolveOutcome,

@@ -17,7 +17,7 @@ export interface PresetColor {
   /** SGR close parameters; defaults to `39` (reset the foreground group only). */
   readonly close?: string
   /** Attribute params composed with the truecolor foreground (the dim's faint). */
-  readonly truecolorAttribute?: { readonly open: string, readonly close: string }
+  readonly truecolorAttribute?: { readonly open: string; readonly close: string }
 }
 
 /** A named theme: overrides for the palette's color roles. */

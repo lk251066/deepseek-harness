@@ -80,7 +80,7 @@ export class QueueDialog implements Component {
       Math.max(1, Math.min(8, items.length || 1)),
       dialogSelectTheme(palette),
     )
-    this.list.onSelect = item => {
+    this.list.onSelect = (item) => {
       const entry = entries.find(candidate => candidate.id === item.value)
       if (entry !== undefined) this.onEdit(entry)
       this.close()

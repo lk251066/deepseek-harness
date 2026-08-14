@@ -709,6 +709,11 @@ export class ToolCardComponent extends CachedCardComponent {
     return this.result === undefined
   }
 
+  /** The call's registered tool name, for grouping and group summaries. */
+  get toolName(): string {
+    return this.name
+  }
+
   /**
    * The card's current verb label (progressive while pending, settled after),
    * for surfaces that name the call outside the transcript (approval dialogs).
@@ -1002,6 +1007,174 @@ export class ToolCardComponent extends CachedCardComponent {
     // A whitespace-only row carries no output to dim; leaving it unwrapped keeps
     // Markdown's padding out of the styled ranges.
     return rows.map(row => row.trim() === '' ? row : this.palette.dim(row))
+  }
+}
+
+/**
+ * A foldable tool name → the noun its calls tally in a collapsed group row:
+ * `read` reads files, `grep` searches patterns, `glob` lists directories (the
+ * harness has no separate `ls` tool — `glob` owns directory listings). A
+ * foldable name absent from this table falls back to a per-name count segment.
+ */
+const TOOL_GROUP_NOUNS: Readonly<Record<string, 'file' | 'pattern' | 'dir'>> = {
+  read: 'file',
+  grep: 'pattern',
+  glob: 'dir',
+}
+
+/** The verb each category segment headlines (`file` first, so a full row reads `Read 2 files · searched 1 pattern`). */
+const TOOL_GROUP_VERBS: Readonly<Record<'file' | 'pattern' | 'dir', string>> = {
+  file: 'Read',
+  pattern: 'searched',
+  dir: 'listed',
+}
+
+/** The collapsed-group category order: files, then patterns, then directories. */
+const TOOL_GROUP_ORDER = ['file', 'pattern', 'dir'] as const
+
+/**
+ * A run of adjacent low-signal tool calls (reads, searches, listings)
+ * collapsed into one Claude-Code-style summary row — `⏺ Read 12 files ·
+ * searched 3 patterns · listed 2 dirs (ctrl+o to expand)`, one dim row with
+ * bold counts where twenty full cards used to stand. The member cards are
+ * reused, so results keep flowing into the same objects: `collapsed` renders
+ * only the summary (its glyph tracks the newest pending member, with that
+ * call's label as the activity hint), `expanded` lists each member's own rows
+ * beneath the summary (through the members' per-card width caches), and
+ * `hidden` drops the row together with the cards.
+ */
+export class CollapsedToolGroupComponent extends CachedCardComponent {
+  private visibility: ToolCardVisibility = 'collapsed'
+  private spinnerFrame: string | undefined
+  private readonly members: ToolCardComponent[]
+
+  constructor(cards: readonly ToolCardComponent[], private readonly palette: Palette) {
+    super()
+    this.members = [...cards]
+  }
+
+  /** The member cards, in arrival order. */
+  get cards(): readonly ToolCardComponent[] {
+    return this.members
+  }
+
+  /**
+   * Add one more adjacent member call and re-render the summary.
+   * @param card - The later foldable call's card, already registered with the
+   * visibility cycle and result map by the assembly layer.
+   */
+  add(card: ToolCardComponent): void {
+    this.members.push(card)
+    this.dropLines()
+  }
+
+  /** The newest member still awaiting its result, when the run is mid-flight. */
+  private pendingCard(): ToolCardComponent | undefined {
+    return this.members.findLast(card => card.isPending())
+  }
+
+  /**
+   * Show `frame` in place of the pending glyph (the braille spinner) while any
+   * member pends; a fully settled group ignores it.
+   * @param frame - The spinner frame glyph, or `undefined` for the hollow dot.
+   */
+  setSpinner(frame: string | undefined): void {
+    if (this.spinnerFrame === frame) return
+    this.spinnerFrame = frame
+    if (this.pendingCard() !== undefined) this.dropLines()
+  }
+
+  /**
+   * Drop cached rows after a member card mutated outside this component — a
+   * result landing (settled glyph, counts) or any other state the summary reads.
+   */
+  refresh(): void {
+    this.dropLines()
+  }
+
+  /**
+   * Set the group's visibility state.
+   * @param visibility - Hidden (nothing at all), collapsed summary row, or the
+   * expanded list of member cards.
+   */
+  setVisibility(visibility: ToolCardVisibility): void {
+    this.visibility = visibility
+    this.dropLines()
+  }
+
+  /**
+   * The summary segments in display order: the three fixed categories
+   * (`files`, `patterns`, `dirs`), then per-tool-name counts for foldable
+   * names with no category. Each carries the wording split around its count so
+   * the row can bold the number while the prose stays dim.
+   */
+  private segments(): readonly { count: number; before: string; after: string }[] {
+    const counts: Record<string, number> = { file: 0, pattern: 0, dir: 0 }
+    const others = new Map<string, number>()
+    for (const card of this.members) {
+      const noun = TOOL_GROUP_NOUNS[card.toolName]
+      if (noun !== undefined) counts[noun] = (counts[noun] ?? 0) + 1
+      else others.set(card.toolName, (others.get(card.toolName) ?? 0) + 1)
+    }
+    const segments: { count: number; before: string; after: string }[] = []
+    const push = (count: number, before: string, after: string, capitalize: boolean): void => {
+      segments.push({
+        count,
+        before: capitalize && before !== '' ? before.slice(0, 1).toUpperCase() + before.slice(1) : before,
+        after,
+      })
+    }
+    let first = true
+    for (const noun of TOOL_GROUP_ORDER) {
+      const count = counts[noun] ?? 0
+      if (count === 0) continue
+      push(count, `${TOOL_GROUP_VERBS[noun]} `, ` ${noun}${count === 1 ? '' : 's'}`, first)
+      first = false
+    }
+    for (const [name, count] of others) {
+      push(count, '', ` × ${name}`, false)
+    }
+    return segments
+  }
+
+  /**
+   * The summary row through the palette: dim prose and glyph, bold counts, the
+   * pieces concatenated (SGR has no color stack, so spans never nest).
+   * @param glyph - The state glyph (pending spinner frame or settled dot).
+   */
+  private summaryRow(glyph: string): string {
+    const dim = this.palette.dim
+    const bold = this.palette.bold
+    const pieces: string[] = [dim(glyph), dim(' ')]
+    for (const [index, segment] of this.segments().entries()) {
+      if (index > 0) pieces.push(dim(' · '))
+      if (segment.before !== '') pieces.push(dim(segment.before))
+      pieces.push(bold(String(segment.count)))
+      pieces.push(dim(segment.after))
+    }
+    return pieces.join('')
+  }
+
+  protected renderLines(width: number): string[] {
+    // Hidden renders nothing — not even the leading gap — so the group leaves
+    // the transcript exactly as its member cards would have.
+    if (this.visibility === 'hidden') return []
+    const pending = this.pendingCard()
+    const glyph = pending === undefined ? TOOL_SETTLED() : this.spinnerFrame ?? '○'
+    if (this.visibility === 'expanded') {
+      // Verbose mode lists every member under the summary header; the members
+      // render through their own cached-card contract, so this stays a plain
+      // concatenation of their rows.
+      return ['', this.summaryRow(glyph), ...this.members.flatMap(card => card.render(width))]
+    }
+    // One card row: the summary, the newest pending call's label as the
+    // activity hint, and the expand shortcut — a single terminal row.
+    const row = [
+      this.summaryRow(glyph),
+      ...(pending === undefined ? [] : [this.palette.dim(` · ${displayInlineText(pending.label())}`)]),
+      this.palette.dim(` ${shortcutHint('ctrl+o', 'expand')}`),
+    ].join('')
+    return ['', truncateToWidth(row, Math.max(1, width - 2), '')]
   }
 }
 

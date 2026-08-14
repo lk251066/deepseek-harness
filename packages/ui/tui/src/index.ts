@@ -102,6 +102,7 @@ import {
   type Config,
 } from './config.ts'
 import {
+  CollapsedToolGroupComponent,
   ContextCardComponent,
   type ToolCardVisibility,
   HeaderComponent,
@@ -305,6 +306,17 @@ export const FILE_REFERENCE_PROMPT = 'Paths prefixed with @ are files explicitly
  */
 const COMPACTION_MARKER = '… earlier context was compacted …'
 
+/**
+ * Low-signal read/search tools whose adjacent calls collapse into one summary
+ * row (Claude Code's collapsed read/search group): the registered names `read`
+ * (tool-fs), `grep` and `glob` (tool-fs-search). The harness has no separate
+ * `ls`/`list` tool — `glob` owns directory listings.
+ */
+const FOLDABLE_TOOLS: ReadonlySet<string> = new Set(['read', 'grep', 'glob'])
+
+/** An adjacent run of foldable calls below this count keeps its standalone cards. */
+const TOOL_GROUP_MIN_CARDS = 3
+
 interface RunningStatus {
   turn: number | undefined
   timer: ReturnType<typeof setInterval>
@@ -436,6 +448,18 @@ export function createTuiChat(
   const tokens = sessionTokens(agent.session)
   const toolCards = new Map<string, ToolCardComponent>()
   const allToolCards = new Set<ToolCardComponent>()
+  /** Every collapsed tool group in the transcript, for visibility and animation passes. */
+  const toolGroups = new Set<CollapsedToolGroupComponent>()
+  /**
+   * The run of adjacent foldable calls currently accumulating toward a group:
+   * `cards` holds the member cards (which render standalone in the chat until
+   * the run reaches {@link TOOL_GROUP_MIN_CARDS}), `component` the group row
+   * that replaced them once it does.
+   */
+  let openToolGroup: {
+    cards: ToolCardComponent[]
+    component: CollapsedToolGroupComponent | undefined
+  } | undefined
   const contextCards = new Set<ContextCardComponent>()
   const liveErrors = new Set<string>()
   const commandControllers = new Set<AbortController>()
@@ -895,6 +919,15 @@ export function createTuiChat(
     return card
   }
 
+  /**
+   * Detach one child from the chat container — the standalone cards a collapsed
+   * group replaces (mirroring `removeStreaming`'s direct children splice).
+   */
+  const removeChatChild = (component: Component): void => {
+    const index = chat.children.indexOf(component)
+    if (index >= 0) chat.children.splice(index, 1)
+  }
+
   // One process-wide spinner tick: the newest pending tool card animates its
   // braille frame, and the working line above the input mirrors the same
   // frame plus the call's verb label. While nothing pends (or the agent is
@@ -929,6 +962,8 @@ export function createTuiChat(
     }
     workShown = true
     if (pending !== undefined) pending.setSpinner(frame)
+    // A collapsed group whose newest member pends animates its summary glyph.
+    for (const group of toolGroups) group.setSpinner(frame)
     workingLine.update(
       running,
       runningStatus?.startedAt ?? compacting?.startedAt,
@@ -1018,6 +1053,18 @@ export function createTuiChat(
       renderChunks: boolean
     },
   ): void => {
+    // Foldable grouping: a run of adjacent low-signal calls ends at any event
+    // that renders something else or moves the conversation along. A
+    // `tool/result` inserts no component of its own (results flow into the
+    // existing cards), so it keeps the run open — a batch's calls land
+    // consecutively and their results follow without breaking the group they
+    // formed.
+    if (
+      event.type !== 'tool/result'
+      && !(event.type === 'tool/call' && FOLDABLE_TOOLS.has(event.data.name))
+    ) {
+      openToolGroup = undefined
+    }
     switch (event.type) {
       case 'user/message': {
         // Injected context (plugin/goal source) renders as a dim context card,
@@ -1103,9 +1150,35 @@ export function createTuiChat(
       }
       // No external Spacer for tool cards: the card renders its own leading
       // gap, so the hidden state removes the row and the gap together.
-      case 'tool/call':
-        chat.addChild(parsedTool(event))
+      case 'tool/call': {
+        const card = parsedTool(event)
+        if (!FOLDABLE_TOOLS.has(event.data.name)) {
+          chat.addChild(card)
+          break
+        }
+        const group = openToolGroup
+        if (group === undefined) {
+          chat.addChild(card)
+          openToolGroup = { cards: [card], component: undefined }
+          break
+        }
+        group.cards.push(card)
+        if (group.component === undefined) {
+          // Below the threshold the run renders as standalone cards; the call
+          // that reaches it swaps the whole run for one group row.
+          chat.addChild(card)
+          if (group.cards.length < TOOL_GROUP_MIN_CARDS) break
+          for (const member of group.cards) removeChatChild(member)
+          const component = new CollapsedToolGroupComponent(group.cards, palette)
+          component.setVisibility(toolsVisibility)
+          toolGroups.add(component)
+          chat.addChild(component)
+          group.component = component
+        } else {
+          group.component.add(card)
+        }
         break
+      }
       case 'tool/result': {
         const callId = event.data.message.source.callId
         let card = toolCards.get(callId)
@@ -1123,9 +1196,15 @@ export function createTuiChat(
           card.setVisibility(toolsVisibility)
           chat.addChild(card)
           allToolCards.add(card)
+          // The orphan fallback is its own card component, so a following
+          // foldable call must not join a run across it.
+          openToolGroup = undefined
         }
         card.updateResult(event.data, event.time)
         toolCards.delete(callId)
+        // A member's result changes every group summary that reads it (settled
+        // glyph, pending hint); drop their cached rows.
+        for (const group of toolGroups) group.refresh()
         break
       }
       case 'todo/write':
@@ -1203,6 +1282,8 @@ export function createTuiChat(
     chat.clear()
     toolCards.clear()
     allToolCards.clear()
+    toolGroups.clear()
+    openToolGroup = undefined
     contextCards.clear()
     assistantSteps.clear()
     streaming = undefined
@@ -1393,6 +1474,9 @@ export function createTuiChat(
   const setToolsVisibility = (next: ToolCardVisibility): void => {
     toolsVisibility = next
     for (const card of allToolCards) card.setVisibility(toolsVisibility)
+    // Group rows ride the same cycle: hidden drops the summary, expanded lists
+    // the member cards (the loop above already set their own visibility).
+    for (const group of toolGroups) group.setVisibility(toolsVisibility)
     // Context cards carry injected instructions rather than tool traffic, so
     // they never hide: the hidden phase reads as their collapsed preview.
     for (const card of contextCards) card.setExpanded(toolsVisibility === 'expanded')

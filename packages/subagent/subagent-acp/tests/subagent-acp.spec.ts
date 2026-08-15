@@ -10,7 +10,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import type { SubprocessOutcome } from '@deepseek-ai/dsh-subprocess'
 import * as acp from '../src/index.ts'
-import { acpStopReason, acpContentText, DEFAULT_DISPOSE_EOF_GRACE_MS, DEFAULT_DISPOSE_GRACE_MS, disposeAcpChild, startAcpRun, toAcpPrompt, type AcpRunSpec } from '../src/run.ts'
+import { acpPermissionResponse, acpStopReason, relayedToolName, acpContentText, DEFAULT_DISPOSE_EOF_GRACE_MS, DEFAULT_DISPOSE_GRACE_MS, disposeAcpChild, startAcpRun, toAcpPrompt, type AcpRunSpec, type RemoteApprovalOutcome } from '../src/run.ts'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import { spawnSubprocess } from '@deepseek-ai/dsh-subprocess-local/src/spawn.ts'
 
@@ -41,7 +41,7 @@ interface SetupEnv {
  * Mount the ACP backend pointed at the mock server, scripted by `mockEnv`.
  * `permission` selects the backend's auto-answer policy.
  */
-async function setup(mockEnv: SetupEnv = {}, permission: 'allow' | 'reject' = 'reject', overrides: Record<string, unknown> = {}) {
+async function setup(mockEnv: SetupEnv = {}, permission: 'allow' | 'reject' | 'ask' = 'reject', overrides: Record<string, unknown> = {}) {
   const ctx = new Context()
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(LocalSubprocessRuntime)
@@ -966,5 +966,174 @@ describe('dsh-subagent-acp', () => {
     expect(unwrapped).toBe(acp)
     expect(unwrapped.name).toBe('subagent-acp')
     expect(typeof unwrapped.apply).toBe('function')
+  })
+})
+
+
+describe('permission ask relay', () => {
+  /** Minimal well-typed request carrying the given options. */
+  const permissionParams = (options: Array<{ optionId: string; name: string; kind: 'allow_once' | 'reject_once' }>) =>
+    ({ sessionId: 's', toolCall: { toolCallId: 'c', title: 't' }, options })
+
+  /** One recorded relayed ask. */
+  interface RecordedAsk {
+    toolName: string
+    reason: string | undefined
+    agent: unknown
+  }
+
+  /** Mount a fake approval service recording asks and answering `outcome`. */
+  function provideApproval(ctx: Context, asks: RecordedAsk[], outcome: RemoteApprovalOutcome | 'never'): void {
+    ctx.provide('approval', {
+      async request(ask: { toolName: string; reason?: string; agent: unknown; signal?: AbortSignal }) {
+        asks.push({ toolName: ask.toolName, reason: ask.reason, agent: ask.agent })
+        if (outcome === 'never') {
+          return new Promise<RemoteApprovalOutcome>((_, reject) => {
+            ask.signal?.addEventListener('abort', () => reject(new Error('ask aborted')), { once: true })
+          })
+        }
+        return outcome
+      },
+    } as never)
+  }
+
+  it('maps every outcome onto the child-offered options', () => {
+    const params = permissionParams([
+      { optionId: 'yes', name: 'Allow', kind: 'allow_once' },
+      { optionId: 'no', name: 'Reject', kind: 'reject_once' },
+    ])
+    expect(acpPermissionResponse(params, 'allowed-once')).toEqual({ outcome: { outcome: 'selected', optionId: 'yes' } })
+    expect(acpPermissionResponse(params, 'rejected')).toEqual({ outcome: { outcome: 'selected', optionId: 'no' } })
+    expect(acpPermissionResponse(params, 'cancelled')).toEqual({ outcome: { outcome: 'cancelled' } })
+    expect(acpPermissionResponse(params, 'unavailable')).toEqual({ outcome: { outcome: 'cancelled' } })
+  })
+
+  it('a grant with no allow-shaped option degrades to cancelled (fail-closed)', () => {
+    const params = permissionParams([{ optionId: 'no', name: 'Reject', kind: 'reject_once' }])
+    expect(acpPermissionResponse(params, 'allowed-once')).toEqual({ outcome: { outcome: 'cancelled' } })
+  })
+
+  it('a rejection with no reject-shaped option also degrades to cancelled', () => {
+    const params = permissionParams([{ optionId: 'yes', name: 'Allow', kind: 'allow_once' }])
+    expect(acpPermissionResponse(params, 'rejected')).toEqual({ outcome: { outcome: 'cancelled' } })
+  })
+
+  it('relays the ask to the parent-attributed approval service and honors the grant', async () => {
+    const asks: RecordedAsk[] = []
+    const ctx = await setup({ MOCK_PERMISSION: '1' }, 'ask')
+    provideApproval(ctx, asks, 'allowed-once')
+    const parent = { id: 'parent', session: { header: { cwd: process.cwd() } } } as unknown as Agent
+    const run = await ctx.subagents.start('acp', { prompt: [{ type: 'text' as const, text: 'p' }], parent, signal: new AbortController().signal })
+    const result = await run.result
+    await run.dispose()
+    // The grant selected the mock's allow option, so it answered normally.
+    expect(result.stopReason).toBe('completed')
+    // The relay reached the approval service with the provider-namespaced
+    // tool name (the mock's title) and attributed to the delegating parent.
+    expect(asks).toHaveLength(1)
+    expect(asks[0]?.toolName).toBe('acp:mock side effect')
+    expect(asks[0]?.agent).toBe(parent)
+  })
+
+  it('forwards the child-side reason from the toolCall _meta', async () => {
+    const asks: RecordedAsk[] = []
+    const ctx = await setup({ MOCK_PERMISSION: '1', MOCK_PERMISSION_REASON: '1' }, 'ask')
+    provideApproval(ctx, asks, 'rejected')
+    const parent = { id: 'parent', session: { header: { cwd: process.cwd() } } } as unknown as Agent
+    const run = await ctx.subagents.start('acp', { prompt: [{ type: 'text' as const, text: 'p' }], parent, signal: new AbortController().signal })
+    await run.result
+    await run.dispose()
+    expect(asks).toHaveLength(1)
+    expect(asks[0]?.reason).toBe('touch /etc/passwd')
+  })
+
+  it('a rejecting requestApproval callback fails closed at the run layer', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'acp-ask-reject-'))
+    try {
+      const run = await startAcpRun(request(), {
+        command: process.execPath,
+        args: [mockServer],
+        cwd: process.cwd(),
+        spawnCwd: process.cwd(),
+        permission: 'ask',
+        requestApproval: () => Promise.reject(new Error('relay exploded')),
+        env: { MOCK_PERMISSION: '1' },
+        disposeEofGraceMs: DEFAULT_DISPOSE_EOF_GRACE_MS,
+        disposeGraceMs: DEFAULT_DISPOSE_GRACE_MS,
+        spawn: spawnSubprocess,
+      })
+      const result = await run.result
+      await run.dispose()
+      expect(result.stopReason).toBe('aborted')
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('an absent approval service fail-closes the ask (child sees cancelled)', async () => {
+    const ctx = await setup({ MOCK_PERMISSION: '1' }, 'ask')
+    const parent = { id: 'parent', session: { header: { cwd: process.cwd() } } } as unknown as Agent
+    const run = await ctx.subagents.start('acp', { prompt: [{ type: 'text' as const, text: 'p' }], parent, signal: new AbortController().signal })
+    const result = await run.result
+    await run.dispose()
+    // The cancelled ask ends the mock's prompt with stopReason cancelled,
+    // which the client maps to an aborted subagent run.
+    expect(result.stopReason).toBe('aborted')
+  })
+
+  it('derives the relayed tool name, degrading on missing or empty titles', () => {
+    const toolCall = (title: string | null | undefined) => ({ toolCallId: 'c', ...title === undefined ? {} : { title } })
+    const req = (title: string | null | undefined) =>
+      ({ sessionId: 's', options: [], toolCall: toolCall(title) }) as Parameters<typeof relayedToolName>[0]
+    expect(relayedToolName(req('bash'))).toBe('bash')
+    expect(relayedToolName(req(undefined))).toBe('unknown-tool')
+    expect(relayedToolName(req(null))).toBe('unknown-tool')
+    expect(relayedToolName(req(''))).toBe('unknown-tool')
+  })
+
+  it('a non-Error relay throw is stringified, not propagated', async () => {
+    const ctx = await setup({ MOCK_PERMISSION: '1' }, 'ask')
+    ctx.provide('approval', {
+      async request() {
+        throw 'plain string failure'
+      },
+    } as never)
+    const parent = { id: 'parent', session: { header: { cwd: process.cwd() } } } as unknown as Agent
+    const run = await ctx.subagents.start('acp', { prompt: [{ type: 'text' as const, text: 'p' }], parent, signal: new AbortController().signal })
+    const result = await run.result
+    await run.dispose()
+    expect(result.stopReason).toBe('aborted')
+  })
+
+  it('a rejecting relay fails closed without an unhandled rejection', async () => {
+    const asks: RecordedAsk[] = []
+    const ctx = await setup({ MOCK_PERMISSION: '1' }, 'ask')
+    ctx.provide('approval', {
+      async request() {
+        throw new Error('waterfall exploded')
+      },
+    } as never)
+    const parent = { id: 'parent', session: { header: { cwd: process.cwd() } } } as unknown as Agent
+    const run = await ctx.subagents.start('acp', { prompt: [{ type: 'text' as const, text: 'p' }], parent, signal: new AbortController().signal })
+    const result = await run.result
+    await run.dispose()
+    expect(result.stopReason).toBe('aborted')
+    expect(asks).toHaveLength(0)
+  })
+
+  it('aborting the run while the human is thinking unwinds the ask and settles aborted', async () => {
+    const asks: RecordedAsk[] = []
+    const ctx = await setup({ MOCK_PERMISSION: '1' }, 'ask')
+    provideApproval(ctx, asks, 'never')
+    const parent = { id: 'parent', session: { header: { cwd: process.cwd() } } } as unknown as Agent
+    const controller = new AbortController()
+    const run = await ctx.subagents.start('acp', { prompt: [{ type: 'text' as const, text: 'p' }], parent, signal: controller.signal })
+    // Give the child a moment to reach the ask, then cancel from the human side.
+    await new Promise(resolve => setTimeout(resolve, 400))
+    controller.abort()
+    const result = await run.result
+    await run.dispose()
+    expect(result.stopReason).toBe('aborted')
+    expect(asks).toHaveLength(1)
   })
 })

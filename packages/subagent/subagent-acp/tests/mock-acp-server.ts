@@ -138,7 +138,11 @@ function makeAgent(conn: AgentSideConnection): Agent {
           ]
         const decision = await conn.requestPermission({
           sessionId: params.sessionId,
-          toolCall: { toolCallId: 'mock-call', title: 'mock side effect' },
+          // Under MOCK_PERMISSION_REASON the protocol-reserved _meta carries
+          // the child-side reason, the way the dsh ACP bridge forwards it.
+          toolCall: process.env.MOCK_PERMISSION_REASON === '1'
+            ? { toolCallId: 'mock-call', title: 'mock side effect', _meta: { reason: 'touch /etc/passwd' } }
+            : { toolCallId: 'mock-call', title: 'mock side effect' },
           options,
         })
         if (decision.outcome.outcome === 'cancelled') {

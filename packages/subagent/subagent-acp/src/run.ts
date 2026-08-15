@@ -29,7 +29,26 @@ import type { SubagentResult, SubagentRun, SubagentStartRequest, SubagentStopRea
 import type { SubprocessHandle, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 
 /** Fixed response to child permission requests: reject by default, or select the first allow option. */
-export type PermissionPolicy = 'allow' | 'reject'
+export type PermissionPolicy = 'allow' | 'reject' | 'ask'
+
+/**
+ * One human-relayed permission ask under the `ask` policy: the child tool's
+ * namespaced name (e.g. `acp:bash`), the child-supplied reason when present,
+ * and the ask's cancellation signal (the run's request signal plus the
+ * run-settled controller — either settling closes the ask).
+ */
+export interface RemotePermissionAsk {
+  readonly toolName: string
+  readonly reason?: string
+  readonly signal: AbortSignal
+}
+
+/**
+ * The closed outcome vocabulary the relay may resolve to — exactly the
+ * user-approval service's vocabulary, so an answerer's decision flows through
+ * unchanged.
+ */
+export type RemoteApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
 
 /** Resolved spawn spec for an ACP child process (no defaults — see Config). */
 export interface AcpRunSpec {
@@ -54,8 +73,15 @@ export interface AcpRunSpec {
    * to the pre-remote-era behavior).
    */
   spawnCwd: string
-  /** How to auto-answer the child's permission prompts. */
+  /** How to answer the child's permission prompts. */
   permission: PermissionPolicy
+  /**
+   * Human relay for the child's permission prompts under the `ask` policy:
+   * resolves to the approval outcome, fail-closed by the caller when absent.
+   * The provider wires this to the user-approval waterfall attributed to the
+   * delegating parent agent, so a TUI's per-slot approval dialog claims it.
+   */
+  requestApproval?: (ask: RemotePermissionAsk) => Promise<RemoteApprovalOutcome>
   /**
    * Extra environment variables to ADD for the child (e.g. the child harness's
    * `DEEPSEEK_API_KEY`). Merged on top of the subprocess seam's scrubbed
@@ -177,6 +203,50 @@ export function acpContentText(content: AcpContentBlock): string {
 }
 
 /**
+ * Translate an approval outcome into the ACP permission response: a grant
+ * selects the first allow-shaped option (none offered → cancelled), a
+ * rejection selects the first reject-shaped option, and every closed/absent
+ * channel answers cancelled so the child never proceeds on an unresolved ask.
+ * Pure — the unit suite asserts each mapping directly.
+ * @param params - the child's request (its option list).
+ * @param outcome - the relayed decision vocabulary.
+ * @returns the ACP response for the child.
+ */
+export function acpPermissionResponse(
+  params: RequestPermissionRequest,
+  outcome: RemoteApprovalOutcome,
+): RequestPermissionResponse {
+  if (outcome === 'allowed-once') {
+    const allow = params.options.find(o => o.kind === 'allow_once' || o.kind === 'allow_always')
+    if (allow !== undefined) return { outcome: { outcome: 'selected', optionId: allow.optionId } }
+  } else if (outcome === 'rejected') {
+    const reject = params.options.find(o => o.kind === 'reject_once' || o.kind === 'reject_always')
+    if (reject !== undefined) return { outcome: { outcome: 'selected', optionId: reject.optionId } }
+  }
+  return { outcome: { outcome: 'cancelled' } }
+}
+
+/**
+ * The tool name a child's permission ask is relayed under: the child names
+ * its own tool (`bash`), and the relay namespaces it with the provider so a
+ * session-scoped "always allow acp:bash" never greenlights the LOCAL bash.
+ * A child that sent no usable title degrades to a placeholder name.
+ */
+export function relayedToolName(params: RequestPermissionRequest): string {
+  const title = params.toolCall.title
+  return title === undefined || title === null || title === '' ? 'unknown-tool' : title
+}
+
+/**
+ * The ask's reason, carried in the toolCall's protocol-reserved `_meta` by the
+ * dsh ACP bridge (the title stays the tool name). Absent on foreign agents.
+ */
+function relayReason(params: RequestPermissionRequest): { reason?: string } {
+  const meta = (params.toolCall as { _meta?: { reason?: unknown } })._meta
+  return typeof meta?.reason === 'string' && meta.reason !== '' ? { reason: meta.reason } : {}
+}
+
+/**
  * Translate the harness prompt blocks into ACP prompt blocks (text only).
  * @param prompt - the harness prompt; non-text blocks are dropped.
  * @returns the ACP text blocks, in order.
@@ -249,6 +319,10 @@ export async function startAcpRun(request: SubagentStartRequest, spec: AcpRunSpe
   const fold = new AssistantOutputFold()
   // Shared mutable state keeps cancellation visible across async closures.
   const flags = { cancelled: false }
+  // Closes when the run's result settles (prompt done, failed, crashed) or the
+  // run is disposed — a human-relayed permission ask still pending at that
+  // point must unwind immediately instead of waiting for the human.
+  const runSettled = new AbortController()
 
   const makeClient = (_agent: AcpAgent): Client => ({
     sessionUpdate(params: SessionNotification): Promise<void> {
@@ -261,6 +335,20 @@ export async function startAcpRun(request: SubagentStartRequest, spec: AcpRunSpe
       return Promise.resolve()
     },
     requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+      // `ask` relays the child's prompt to a human (the provider wires the
+      // user-approval waterfall): the callback may legitimately pend for a
+      // long time, bounded by the request signal plus run settlement.
+      if (spec.permission === 'ask' && spec.requestApproval !== undefined) {
+        const relay = spec.requestApproval({
+          toolName: relayedToolName(params),
+          ...relayReason(params),
+          signal: AbortSignal.any([request.signal, runSettled.signal]),
+        })
+        return relay.then(
+          outcome => acpPermissionResponse(params, outcome),
+          () => acpPermissionResponse(params, 'unavailable'),
+        )
+      }
       // Auto-answer by the configured policy. `allow` selects the first option
       // whose kind is `allow_once` or `allow_always`; if the child offered none (or we
       // reject), answer `cancelled` so the child does not proceed.
@@ -357,6 +445,9 @@ export async function startAcpRun(request: SubagentStartRequest, spec: AcpRunSpe
       return { output: collectOutput(), stopReason: 'error' }
     } finally {
       request.signal.removeEventListener('abort', onAbort)
+      // A settled run closes any still-pending human-relayed permission ask:
+      // the child is gone or done, so the dialog must retract now.
+      runSettled.abort()
     }
   })()
 
@@ -369,6 +460,7 @@ export async function startAcpRun(request: SubagentStartRequest, spec: AcpRunSpe
       if (disposal !== undefined) return disposal
       request.signal.removeEventListener('abort', onAbort)
       requestCancel()
+      runSettled.abort()
       // The shared platform-aware ladder awaits exit. ACP normally quiesces from
       // stdin EOF, including the final flush, so this backend uses a wider EOF
       // grace before process termination escalates.

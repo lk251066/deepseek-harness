@@ -18,7 +18,28 @@ import type {
   SubagentStartRequest,
 } from '@deepseek-ai/dsh-subagent'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
-import { type AcpRunSpec, DEFAULT_DISPOSE_EOF_GRACE_MS, DEFAULT_DISPOSE_GRACE_MS, type PermissionPolicy, startAcpRun } from './run.ts'
+import {
+  type AcpRunSpec,
+  DEFAULT_DISPOSE_EOF_GRACE_MS,
+  DEFAULT_DISPOSE_GRACE_MS,
+  type PermissionPolicy,
+  type RemoteApprovalOutcome,
+  startAcpRun,
+} from './run.ts'
+
+/**
+ * The minimal user-approval surface the `ask` relay consumes — a structural
+ * read like the ACP bridge's `ContinuableDrain`, so this package stays
+ * dependency-light against an optional-at-runtime service.
+ */
+interface ApprovalRelay {
+  request(ask: {
+    agent: SubagentStartRequest['parent']
+    toolName: string
+    reason?: string
+    signal?: AbortSignal
+  }): Promise<RemoteApprovalOutcome>
+}
 
 export const name = 'subagent-acp'
 export const inject = ['subagents', 'subprocess']
@@ -51,9 +72,11 @@ export interface Config {
    */
   cwdWorld: 'local' | 'remote'
   /**
-   * How to auto-answer the child's `session/request_permission` prompts:
-   * `reject` (default — decline every prompt) or `allow` (approve via the first
-   * `allow_once` or `allow_always` option). No prompt is surfaced to a human.
+   * How to answer the child's `session/request_permission` prompts:
+   * `reject` (default — decline every prompt), `allow` (approve via the first
+   * `allow_once` or `allow_always` option), or `ask` (relay to a HUMAN: the
+   * parent process's approval waterfall answers, so a TUI shows its approval
+   * dialog and the decision flows back to the child).
    */
   permission: PermissionPolicy
   /**
@@ -80,7 +103,7 @@ export const Config: z<Config> = z.object({
   args: z.array(z.string()).default([]),
   cwd: z.string(),
   cwdWorld: z.union(['local', 'remote'] as const).default('local'),
-  permission: z.union(['allow', 'reject'] as const).default('reject'),
+  permission: z.union(['allow', 'reject', 'ask'] as const).default('reject'),
   env: z.dict(z.string()).default({}),
   disposeEofGraceMs: z.number().default(DEFAULT_DISPOSE_EOF_GRACE_MS),
   disposeGraceMs: z.number().default(DEFAULT_DISPOSE_GRACE_MS),
@@ -211,6 +234,9 @@ class AcpProvider implements SubagentProvider {
       disposeEofGraceMs: this.config.disposeEofGraceMs,
       disposeGraceMs: this.config.disposeGraceMs,
       spawn: spec => this.ctx.subprocess.spawn(spec),
+      ...(this.config.permission === 'ask'
+        ? { requestApproval: ask => this.relayApproval(request, ask.toolName, ask) }
+        : {}),
       onError: (error, stopReason) => {
         // The seam forbids `result` rejecting, so a child-level failure is
         // flattened to a stop reason — preserve it here rather than losing it.
@@ -218,6 +244,36 @@ class AcpProvider implements SubagentProvider {
       },
     }
     return startAcpRun(request, spec)
+  }
+
+  /**
+   * Relay one child permission ask into the parent process's user-approval
+   * waterfall, attributed to the DELEGATING parent agent — a TUI's per-slot
+   * answerer claims exactly that agent, so its approval dialog handles the
+   * ask. The tool name is provider-namespaced so a session-scoped grant
+   * ("always allow acp:bash") can never greenlight the local bash. Fail-closed
+   * on every degraded path: service absent, request rejected, or a throwing
+   * waterfall resolves `unavailable`, which the run maps to a cancelled ask.
+   */
+  private async relayApproval(
+    request: ResolvedSubagentStartRequest,
+    toolName: string,
+    ask: { reason?: string; signal: AbortSignal },
+  ): Promise<RemoteApprovalOutcome> {
+    const approval = this.ctx.get('approval') as ApprovalRelay | undefined
+    if (approval === undefined) return 'unavailable'
+    const namespaced = `${this.name}:${toolName}`
+    try {
+      return await approval.request({
+        agent: request.parent,
+        toolName: namespaced,
+        ...ask.reason === undefined ? {} : { reason: ask.reason },
+        signal: ask.signal,
+      })
+    } catch (error) {
+      this.ctx.logger.warn(`subagent-acp "${this.name}": permission relay failed: ${error instanceof Error ? error.message : String(error)}`)
+      return 'unavailable'
+    }
   }
 
   /** The load-validated remote workspace; the guard below is unreachable in a composed deployment. */

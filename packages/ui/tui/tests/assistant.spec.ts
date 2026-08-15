@@ -101,10 +101,21 @@ async function tick(): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, 25))
 }
 
+/** One row of the memory double's backing list. */
+interface MemoryRowDouble {
+  id: string
+  text: string
+  tags: readonly string[]
+  createdAt: number
+  updatedAt: number
+}
+
 /** The optional memory service double: records the installTools receiver. */
 interface MemoryDouble {
   installTools: (agentCtx: unknown) => void
-  list: () => { id: string; text: string; tags: readonly string[]; createdAt: number; updatedAt: number }[]
+  list: () => MemoryRowDouble[]
+  remove: (id: string) => Promise<boolean>
+  rows: MemoryRowDouble[]
 }
 
 interface AssistantHarnessOptions {
@@ -124,7 +135,18 @@ async function assistantHarness(options: AssistantHarnessOptions = {}): Promise<
   const created: CreatedAgentRecord[] = []
   const memory: MemoryDouble = {
     installTools: vi.fn(),
-    list: () => [{ id: 'm1', text: 'likes lattes', tags: ['food'], createdAt: 1, updatedAt: 2 }],
+    rows: [
+      { id: 'm1', text: 'likes lattes', tags: ['food'], createdAt: 1, updatedAt: 2 },
+      { id: 'm2', text: 'hates cilantro', tags: [], createdAt: 1, updatedAt: 3 },
+    ],
+    list() {
+      return [...this.rows]
+    },
+    async remove(id: string) {
+      const before = this.rows.length
+      this.rows = this.rows.filter(row => row.id !== id)
+      return this.rows.length < before
+    },
   }
   const terminal = new RecordingTerminal()
   const harness = await createTuiTestHarness(terminal, vi.fn(), {
@@ -318,6 +340,23 @@ describe('/memories', () => {
       harness.terminal.send('r')
       await tick()
       expect(harness.terminal.output).toContain('likes oolong')
+    } finally {
+      await disposeTuiTestHarness(harness)
+    }
+  })
+
+  it('deletes a memory through the browser dialog', async () => {
+    const { harness, memory } = await assistantHarness()
+    try {
+      submit(harness, '/memories')
+      await tick()
+      expect(harness.terminal.output).toContain('likes lattes')
+      expect(harness.terminal.output).toContain('hates cilantro')
+      harness.terminal.send('d')
+      await tick()
+      await tick()
+      expect(memory.rows.map(row => row.id)).toEqual(['m2'])
+      expect(harness.terminal.output.slice(harness.terminal.output.lastIndexOf('Memories'))).not.toContain('likes lattes')
     } finally {
       await disposeTuiTestHarness(harness)
     }

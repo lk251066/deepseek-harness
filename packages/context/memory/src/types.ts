@@ -32,4 +32,6 @@ export interface Config {
   readonly maxTextBytes: number
   /** Character budget for the auto-recalled prompt section. */
   readonly recallMaxChars: number
+  /** Store-size ceiling; the oldest memories evict on the next add. */
+  readonly maxMemories: number
 }

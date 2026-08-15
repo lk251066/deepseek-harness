@@ -22,7 +22,7 @@ async function harness(root: string) {
   await ctx.plugin(Storage)
   await ctx.plugin(StorageJson, { root })
   await ctx.plugin(StorageDomain, { backend: 'json' })
-  await ctx.plugin(MemoryService, { maxTextBytes: 20, recallMaxChars: 120 })
+  await ctx.plugin(MemoryService, { maxTextBytes: 20, recallMaxChars: 120, maxMemories: 50 })
   return { ctx, memory: ctx.memory }
 }
 
@@ -98,10 +98,10 @@ describe('memory service', () => {
 
   it('rejects invalid deployment limits at the configuration boundary', async () => {
     const first = new Context()
-    expect(() => new MemoryService(first, { maxTextBytes: 0, recallMaxChars: 100 })).toThrow('maxTextBytes')
+    expect(() => new MemoryService(first, { maxTextBytes: 0, recallMaxChars: 100, maxMemories: 10 })).toThrow('maxTextBytes')
     await first.fiber.dispose()
     const second = new Context()
-    expect(() => new MemoryService(second, { maxTextBytes: 10, recallMaxChars: 1.5 })).toThrow('recallMaxChars')
+    expect(() => new MemoryService(second, { maxTextBytes: 10, recallMaxChars: 1.5, maxMemories: 10 })).toThrow('recallMaxChars')
     await second.fiber.dispose()
   })
 
@@ -111,7 +111,7 @@ describe('memory service', () => {
     await raw.plugin(StorageJson, { root: await freshRoot() })
     await raw.plugin(StorageDomain, { backend: 'json' })
     // Constructed directly, never started: the domain never opens.
-    const memory = new MemoryService(raw, { maxTextBytes: 10, recallMaxChars: 100 })
+    const memory = new MemoryService(raw, { maxTextBytes: 10, recallMaxChars: 100, maxMemories: 10 })
     expect(() => memory.list()).toThrow('memory: durable domain is not initialized')
     await expect(memory.add('x')).rejects.toThrow('memory: durable domain is not initialized')
     await raw.fiber.dispose()
@@ -164,6 +164,33 @@ describe('memory service', () => {
     expect(memory.recalledText()).toContain('durable fact')
     await ctx.fiber.dispose()
     expect(memory.recalledText()).toBe('')
+  })
+
+  it('evicts the oldest memories when the store passes its ceiling', async () => {
+    const clock = fakeClock()
+    const ctx = new Context()
+    await ctx.plugin(Storage)
+    await ctx.plugin(StorageJson, { root: await freshRoot() })
+    await ctx.plugin(StorageDomain, { backend: 'json' })
+    await ctx.plugin(MemoryService, { maxTextBytes: 20, recallMaxChars: 120, maxMemories: 2 })
+    const memory = ctx.memory
+    clock.setNow(1_000)
+    await memory.add('oldest fact')
+    clock.setNow(2_000)
+    await memory.add('middle fact')
+    clock.setNow(3_000)
+    await memory.add('newest fact')
+    // The ceiling holds and the oldest-created memory went first.
+    expect(memory.list().map(record => record.text)).toEqual(['middle fact', 'newest fact'])
+    clock.restore()
+    await ctx.fiber.dispose()
+  })
+
+  it('rejects an invalid maxMemories at the configuration boundary', async () => {
+    const invalid = new Context()
+    expect(() => new MemoryService(invalid, { maxTextBytes: 10, recallMaxChars: 100, maxMemories: 0 }))
+      .toThrow('maxMemories')
+    await invalid.fiber.dispose()
   })
 
   it('memories survive a simulated restart over the same durable root', async () => {

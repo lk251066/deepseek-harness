@@ -31,6 +31,8 @@ declare module '@deepseek-ai/cordis' {
 export const DEFAULT_RECALL_MAX_CHARS = 4_000
 /** Default per-memory text budget when config omits `maxTextBytes`. */
 export const DEFAULT_MAX_TEXT_BYTES = 2_000
+/** Default store-size ceiling when config omits `maxMemories`. */
+export const DEFAULT_MAX_MEMORIES = 200
 /** Default result ceiling for `memory_search` when the caller omits `limit`. */
 export const DEFAULT_SEARCH_LIMIT = 20
 
@@ -112,20 +114,23 @@ export default class MemoryService extends Service {
   static Config: s<Config> = s.object({
     maxTextBytes: s.number().step(1).min(1).default(DEFAULT_MAX_TEXT_BYTES),
     recallMaxChars: s.number().step(1).min(1).default(DEFAULT_RECALL_MAX_CHARS),
+    maxMemories: s.number().step(1).min(1).default(DEFAULT_MAX_MEMORIES),
   })
 
   private table: KvTable<MemoryId, MemoryRow> | undefined
   private readonly maxTextBytes: number
   private readonly recallMaxChars: number
+  private readonly maxMemories: number
 
   /**
    * @param ctx - Host context carrying the storage-domain form.
-   * @param config - Deployment-varying text and recall budgets.
+   * @param config - Deployment-varying text, recall, and store-size budgets.
    */
   constructor(ctx: Context, config: Config) {
     super(ctx, 'memory')
     this.maxTextBytes = resolvePositiveInteger(config.maxTextBytes, 'maxTextBytes')
     this.recallMaxChars = resolvePositiveInteger(config.recallMaxChars, 'recallMaxChars')
+    this.maxMemories = resolvePositiveInteger(config.maxMemories, 'maxMemories')
   }
 
   /** Open and own the one memory domain. */
@@ -161,7 +166,21 @@ export default class MemoryService extends Service {
       version: nextVersion(),
     }
     await this.requireTable().put(id, row)
+    await this.evictToCeiling()
     return snapshot(id, row)
+  }
+
+  /**
+   * Drop the oldest-created memories until the store fits its ceiling. An
+   * over-ceiling store (a lowered config over old data) trims on the next
+   * `add`, which is the only mutation path that can grow the store.
+   */
+  private async evictToCeiling(): Promise<void> {
+    const table = this.requireTable()
+    const records = this.list()
+    for (const record of records.slice(0, Math.max(0, records.length - this.maxMemories))) {
+      await table.delete(record.id)
+    }
   }
 
   /**

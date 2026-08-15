@@ -112,6 +112,7 @@ import {
   formatDiagnosticNumber,
   formatDiagnosticTime,
   initialTarget,
+  MemoryBrowserDialog,
   SessionPickerDialog,
   StatusCardComponent,
   PromptContextComponent,
@@ -119,6 +120,7 @@ import {
   targetLabel,
   ThemeDialog,
   type DetailsSelection,
+  type MemoryRowView,
   type SessionChoice,
   type StatusCardRow,
 } from './components/dialogs.ts'
@@ -137,10 +139,10 @@ import {
 } from './chat/helpers.ts'
 import { createSessionChannel, type SessionChannel } from './chat/session-channel.ts'
 import { createAssistantController } from './chat/assistant.ts'
-import { MEMORY_UNAVAILABLE_LINES, memoriesLines } from './chat/memories.ts'
+import { MEMORY_UNAVAILABLE_LINES, memoryRows } from './chat/memories.ts'
 // Declaration-merges the optional `memory` service onto `Context`; the TUI
 // reads it per use and never imports the package's runtime code.
-import type {} from '@deepseek-ai/dsh-memory'
+import type { MemoryId } from '@deepseek-ai/dsh-memory'
 import {
   createChannelRegistry,
   DEFAULT_MAX_LIVE_SLOTS,
@@ -1077,12 +1079,6 @@ export function createTuiChat(
     isDisposed,
   })
 
-  /** The `/memories` panel rows, re-read per refresh. */
-  const memoryLines = (): readonly string[] => {
-    const memory = ctx.get('memory')
-    return memory === undefined ? MEMORY_UNAVAILABLE_LINES : memoriesLines(memory.list())
-  }
-
   updatePromptValues()
 
   /** Status-priority placeholder text for the empty editor (dim; the hint editor paints it). */
@@ -1814,14 +1810,25 @@ export function createTuiChat(
     })
     commandCtx.commands.register({
       name: 'memories',
-      description: 'Browse the assistant\'s long-term memories',
+      description: 'Browse and delete the assistant\'s long-term memories',
       handler: () => {
         const memory = ctx.get('memory')
         if (memory === undefined) {
           appendNotice(MEMORY_UNAVAILABLE_LINES[0] ?? 'Memory is not available in this composition.', 'warning')
           return { kind: 'success' }
         }
-        openStaticDialog(insights, 'Memories', [...memoryLines()], () => [...memoryLines()])
+        const rows = (): MemoryRowView[] => memoryRows(memory.list())
+        const session = overlayManager.open({
+          create: () => new MemoryBrowserDialog(
+            rows(),
+            palette,
+            id => memory.remove(id as MemoryId),
+            () => { void session.close() },
+            rows,
+          ),
+          options: { width: 76, anchor: 'center', margin: 1 },
+        })
+        requestRender()
         return { kind: 'success' }
       },
     })

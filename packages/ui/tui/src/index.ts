@@ -5,6 +5,7 @@
  * @module @deepseek-ai/dsh-tui
  */
 
+import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import {
   CombinedAutocompleteProvider,
@@ -111,12 +112,14 @@ import {
   formatDiagnosticNumber,
   formatDiagnosticTime,
   initialTarget,
+  SessionPickerDialog,
   StatusCardComponent,
   PromptContextComponent,
   RenameDialog,
   targetLabel,
   ThemeDialog,
   type DetailsSelection,
+  type SessionChoice,
   type StatusCardRow,
 } from './components/dialogs.ts'
 import {
@@ -134,14 +137,20 @@ import {
 } from './chat/helpers.ts'
 import { createSessionChannel, type SessionChannel } from './chat/session-channel.ts'
 import {
+  createChannelRegistry,
+  DEFAULT_MAX_LIVE_SLOTS,
+  type ChannelRegistry,
+  type SessionSlot,
+} from './chat/channel-registry.ts'
+import {
   createModelController,
   type ModelController,
 } from './chat/model-command.ts'
-import { createApprovalAnswerer } from './chat/approval.ts'
-import { createGoalBar } from './chat/goal-bar.ts'
+import { createApprovalAnswerer, type ApprovalAnswerer } from './chat/approval.ts'
+import { createGoalBar, type GoalBarController } from './chat/goal-bar.ts'
 import { createPermissionController } from './chat/permission.ts'
 import { createQuestionQueue } from './chat/questions.ts'
-import { createQueueDock, replaceQueuedMessage } from './chat/queue-dock.ts'
+import { createQueueDock, replaceQueuedMessage, type QueueDockController } from './chat/queue-dock.ts'
 import { forkSession } from './chat/fork.ts'
 import {
   agentsLines,
@@ -324,6 +333,27 @@ export interface TuiController {
 }
 
 /**
+ * One live session's full per-session state: the chat channel, the per-session
+ * docks, the approval answerer that claims only this slot's agent, and the
+ * agent-scoped listeners (model routing, the @-file prompt section). Built by
+ * the slot factory, swapped under the shared chrome by the channel registry.
+ */
+interface TuiSessionSlot extends SessionSlot {
+  /** Transcript channel: chat container, todo strip, session listeners. */
+  readonly channel: SessionChannel
+  /** The goal dock (Ctrl+G actions) for this session. */
+  readonly goalBar: GoalBarController
+  /** The steering queue dock (/queue sheet) for this session. */
+  readonly queueDock: QueueDockController
+  /** Answers `approval/request` for this slot's agent only. */
+  readonly approvals: ApprovalAnswerer
+  /** Disposer for this agent's model-selection waterfall listeners. */
+  readonly disposeTargetListeners: () => void
+  /** The @-file reference prompt section fiber on this agent's scope. */
+  readonly fileReferenceFiber: Fiber
+}
+
+/**
  * Start the interactive pi-tui channel for an already-created target agent.
  * @param ctx - agent, tools, session-event, and user-interaction context.
  * @param config - target agent, banner, and TUI presentation config.
@@ -336,8 +366,13 @@ export function createTuiChat(
   runtime: TuiRuntime,
 ): TuiController {
   const sessionId = SessionId(config.sessionId ?? 'main')
-  const agent = ctx.agents.get(sessionId)
-  if (agent === undefined) throw new Error(`ui-tui: session "${sessionId}" is not running`)
+  const initialAgent = ctx.agents.get(sessionId)
+  if (initialAgent === undefined) throw new Error(`ui-tui: session "${sessionId}" is not running`)
+  // The initial agent the TUI starts on; the channel registry reassigns this
+  // (with the channel/dock lets below) every time the mounted session switches,
+  // so chrome closures reading them per call always route to the session on
+  // screen. Construction-time captures are the slot factory's own instances.
+  let agent: Agent = initialAgent
   const resolved = resolveTuiConfig(config)
   // Named-theme state: `undefined` is the adaptive `deepseek` default.
   const initialPreset = resolved.theme.name === 'deepseek' ? undefined : THEME_PRESETS[resolved.theme.name]
@@ -358,7 +393,20 @@ export function createTuiChat(
   const todoContainer = new Container()
   const questionContainer = new Container()
   const inputTemplate = parseTuiPromptTemplate(displayInlineText(resolved.theme.inputPrompt))
-  const renderInputPrompt = (): string => renderTuiPromptTemplate(inputTemplate, valueName => ctx.tuiPrompt.get(valueName))
+  /**
+   * Read one prompt value for a render. A render that races the final teardown
+   * (the TUI's debounced render timer firing while the owning context goes
+   * away) must not crash the process: the service read degrades to an unset
+   * fragment and the stale frame renders without it.
+   */
+  const safePromptValue = (valueName: string): string | undefined => {
+    try {
+      return ctx.tuiPrompt.get(valueName)
+    } catch {
+      return undefined
+    }
+  }
+  const renderInputPrompt = (): string => renderTuiPromptTemplate(inputTemplate, safePromptValue)
   const initialInputPrompt = renderInputPrompt()
   const editor = new HintEditor(ui, {
     borderColor: palette.dim,
@@ -400,6 +448,12 @@ export function createTuiChat(
   // `updatePromptValues()` call until after the assignment so no read precedes it.
   // oxlint-disable-next-line prefer-const -- single assignment is a forward-reference, not a const.
   let modelController!: ModelController
+  // The mounted slot's pieces, assigned by the registry's initial mount and
+  // reassigned on every switch. Chrome closures below read them per call, so
+  // message dispatch, commands, status, and prompts follow the mounted session.
+  let channel!: SessionChannel
+  let goalBar!: GoalBarController
+  let queueDock!: QueueDockController
   const now = (): number => runtime.now?.() ?? Date.now()
   const agentStatus = (): AgentStatus => agent.status
   const isDisposed = (): boolean => disposed
@@ -554,7 +608,7 @@ export function createTuiChat(
   const promptContext = new PromptContextComponent(
     parseTuiPromptTemplate(displayInlineText(resolved.theme.leftPrompt)),
     parseTuiPromptTemplate(displayInlineText(resolved.theme.rightPrompt)),
-    valueName => ctx.tuiPrompt.get(valueName),
+    valueName => safePromptValue(valueName),
   )
   ui.addChild(header)
   ui.addChild(new Spacer(1))
@@ -596,8 +650,10 @@ export function createTuiChat(
 
   const appendNotice = (message: string, kind: 'info' | 'warning' | 'error' = 'info'): void => {
     const color = kind === 'error' ? palette.error : kind === 'warning' ? palette.warning : palette.dim
-    chat.addChild(new Spacer(1))
-    chat.addChild(new Text(color(displayText(message)), 0, 0))
+    // The mounted channel's transcript: a notice about any session (including
+    // a backgrounded one) lands where the user is looking.
+    channel.chat.addChild(new Spacer(1))
+    channel.chat.addChild(new Text(color(displayText(message)), 0, 0))
     requestRender()
   }
 
@@ -666,8 +722,6 @@ export function createTuiChat(
     },
   })
 
-  const disposeTargetListeners = installModelSelection(agent.ctx, target)
-
   modelController = createModelController({
     ctx,
     resolved,
@@ -681,7 +735,8 @@ export function createTuiChat(
 
   // Shift+Tab preset ring with the danger-preset risk confirmation overlay.
   const permissionController = createPermissionController({
-    ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent,
+    ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice,
+    get agent(): Agent { return agent },
     confirmRisk: (message, onChoice) => {
       const session = overlayManager.open({
         create: () => new ConfirmDialog(
@@ -697,21 +752,13 @@ export function createTuiChat(
     },
   })
 
-  // The goal dock (Ctrl+G actions) and the steering queue dock (/queue sheet).
-  const goalBar = createGoalBar({ ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent })
-  const queueDock = createQueueDock({
-    ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent,
-    loadIntoEditor: (text) => {
-      editor.setText(text)
-      requestRender()
-    },
-    showTransientNotice,
-  })
-  docks.addChild(goalBar.component)
-  docks.addChild(queueDock.component)
-
-  // Insight surfaces (/context, /agents, /jobs, /settings, /export, stats strip).
-  const insights: InsightsDeps = { ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent }
+  // Insight surfaces (/context, /agents, /jobs, /settings, /export, stats
+  // strip). `agent` is a getter: every insight handler re-reads the mounted
+  // session at call time, so the surfaces follow a /sessions switch.
+  const insights: InsightsDeps = {
+    ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice,
+    get agent(): Agent { return agent },
+  }
 
   /** Resolve one stored image attachment's bytes through the optional store. */
   const loadAttachmentImage = (attachmentId: string): Promise<Uint8Array | undefined> => {
@@ -725,68 +772,292 @@ export function createTuiChat(
     )
   }
 
-  // The per-session chat channel: transcript container, streaming/tool/context
-  // cards, turn status, token totals, and the session-scoped listeners. The
-  // shared chrome below holds the channel's container; every callback it reads
-  // (goal/queue docks, notices, spinner working line) stays live through these
-  // closures.
-  const channel: SessionChannel = createSessionChannel({
-    ctx,
-    agent,
-    resolved,
-    palette,
-    mdTheme,
-    now,
-    terminal: runtime.terminal,
-    requestRender,
-    appendNotice,
-    loadAttachmentImage,
-    addToEditorHistory: (text) => {
-      editor.addToHistory(text)
-    },
-    refreshGoalBar: () => {
-      goalBar.refresh()
-    },
-    refreshQueueDock: () => {
-      refreshQueueDock()
-    },
-    onSessionTitle: (title) => {
-      sessionTitle = title
+  /**
+   * The @-file prompt-section fibers by agent context: one registration per
+   * distinct context, so agents sharing a context (embedders, fakes) do not
+   * collide on the section's global name.
+   */
+  const fileReferenceFibers = new Map<Context, Fiber>()
+
+  /**
+   * Register the @-file reference prompt section on one agent's scope, or
+   * return the existing fiber when that context already carries one.
+   */
+  const registerFileReferenceSection = (slotAgent: Agent): Fiber => {
+    const existing = fileReferenceFibers.get(slotAgent.ctx)
+    if (existing !== undefined) return existing
+    const fiber = slotAgent.ctx.inject(['systemPrompt'], (promptCtx) => {
+      promptCtx.systemPrompt.section({
+        name: 'ui:tui-file-reference',
+        order: 99,
+        // Tool visibility can change dynamically or by agent scope. Empty
+        // sections are omitted by renderPrompt, so guidance never names a
+        // tool that this agent cannot call.
+        text: () => slotAgent.ctx.tools.get('read', slotAgent) === undefined ? '' : FILE_REFERENCE_PROMPT,
+      })
+    })
+    fileReferenceFibers.set(slotAgent.ctx, fiber)
+    return fiber
+  }
+
+  /**
+   * Build one live session's full slot: its chat channel (transcript, cards,
+   * status state machine), its per-session docks, the approval answerer that
+   * claims only this agent's asks, this agent's model-selection routing, and
+   * its @-file prompt section. Called by the registry for the initial session
+   * and for every `/new` adoption; the returned pieces are swapped under the
+   * shared chrome by {@link mountSlot}/{@link unmountSlot}.
+   */
+  const buildSlot = (slotAgent: Agent): TuiSessionSlot => {
+    // The registry is assigned by the createChannelRegistry call below; these
+    // closures only run on session events, which cannot fire before it exists.
+    const isActiveAgent = (): boolean =>
+      /* v8 ignore next -- the registry exists before any session event fires. */
+      registry === undefined || registry.active().agent === slotAgent
+    const slotGoalBar = createGoalBar({ ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent: slotAgent })
+    const slotQueueDock = createQueueDock({
+      ctx, resolved, palette, overlayManager, requestRender, isDisposed, appendNotice, agent: slotAgent,
+      loadIntoEditor: (text) => {
+        editor.setText(text)
+        requestRender()
+      },
+      showTransientNotice,
+    })
+    // The per-session chat channel: transcript container, streaming/tool/
+    // context cards, turn status, token totals, and the session-scoped
+    // listeners. Every chrome callback it reads (docks, notices, spinner
+    // working line) either belongs to this slot or gates on the slot being
+    // mounted, so a backgrounded session never repaints the foreground chrome.
+    const slotChannel: SessionChannel = createSessionChannel({
+      ctx,
+      agent: slotAgent,
+      resolved,
+      palette,
+      mdTheme,
+      now,
+      terminal: runtime.terminal,
+      requestRender,
+      appendNotice,
+      loadAttachmentImage,
+      addToEditorHistory: (text) => {
+        editor.addToHistory(text)
+      },
+      refreshGoalBar: () => {
+        slotGoalBar.refresh()
+      },
+      refreshQueueDock: () => {
+        slotQueueDock.refresh()
+        if (isActiveAgent()) applyEditorHint()
+      },
+      onSessionTitle: (title) => {
+        if (!isActiveAgent()) return
+        sessionTitle = title
+        header.invalidate()
+        updateTerminalTitle()
+      },
+      onToolResult: () => {
+        fileSearch.invalidate()
+      },
+      applyStatus: (status) => {
+        if (isActiveAgent()) setStatus(status)
+      },
+      showReasoning: () => showReasoning,
+      toolsVisibility: () => toolsVisibility,
+      onSpinnerFrame: (running, startedAt, label, frame, extras) => {
+        if (!isActiveAgent()) return
+        workingLine.update(running, startedAt, label, frame, extras)
+        requestRender()
+      },
+      onSpinnerIdle: () => {
+        if (!isActiveAgent()) return
+        workingLine.update(false, undefined, undefined, undefined)
+        requestRender()
+      },
+      onAgentError: (stepKey, error) => {
+        liveErrors.add(stepKey)
+        // Full cause chain: wrapper messages like `fetch failed` carry the
+        // actionable transport detail on `cause`.
+        appendNotice(errorChain(error), 'error')
+      },
+      onAgentDisposed: () => {
+        appendNotice(`Agent "${slotAgent.id}" was disposed.`, 'warning')
+        // Only the mounted session's disposal ends the TUI; a backgrounded
+        // slot losing its agent is a notice, not a shutdown.
+        if (isActiveAgent()) disposed = true
+      },
+    })
+    return {
+      sessionId: slotAgent.session.id,
+      agent: slotAgent,
+      channel: slotChannel,
+      goalBar: slotGoalBar,
+      queueDock: slotQueueDock,
+      approvals: createApprovalAnswerer({
+        ctx,
+        resolved,
+        palette,
+        overlayManager,
+        requestRender,
+        isDisposed,
+        appendNotice,
+        agent: slotAgent,
+        questionMaxHeight: () => {
+          const width = runtime.terminal.columns
+          const editorRows = editor.render(width).length
+          return Math.max(1, Math.min(
+            resolved.questionDialogMaxHeight,
+            runtime.terminal.rows - editorRows,
+          ))
+        },
+        pendingCallLabel: callId => slotChannel.toolCardLabel(callId),
+      }),
+      disposeTargetListeners: installModelSelection(slotAgent.ctx, target),
+      // The @-file reference section registers on the agent's own scope (the
+      // per-agent override the systemPrompt registry names in its collision
+      // error). Agents sharing one context (embedders, fakes) share the first
+      // registration — the section's text() is agent-scoped either way.
+      fileReferenceFiber: registerFileReferenceSection(slotAgent),
+    }
+  }
+
+  /** Wire one slot's components into the shared chrome and start its listeners. */
+  const mountSlot = (slot: TuiSessionSlot): void => {
+    // The transcript mounts below the header; chat is per-session state living
+    // in this shared index-1 slot.
+    ui.children.splice(1, 0, slot.channel.chat)
+    todoContainer.addChild(slot.channel.todo)
+    docks.addChild(slot.goalBar.component)
+    docks.addChild(slot.queueDock.component)
+    slot.channel.attach()
+  }
+
+  /** Unwire one slot's components and stop its session listeners (switch-away). */
+  const unmountSlot = (slot: TuiSessionSlot): void => {
+    slot.channel.detach()
+    const chatIndex = ui.children.indexOf(slot.channel.chat)
+    if (chatIndex >= 0) ui.children.splice(chatIndex, 1)
+    todoContainer.clear()
+    docks.clear()
+  }
+
+  /** Final teardown for one slot (eviction or shutdown): scoped listeners and overlays. */
+  const disposeSlot = (slot: TuiSessionSlot): void => {
+    slot.approvals.drain()
+    slot.approvals.unregister()
+    slot.goalBar.dispose()
+    slot.queueDock.dispose()
+    slot.disposeTargetListeners()
+    for (const [context, registered] of fileReferenceFibers) {
+      if (registered === slot.fileReferenceFiber) fileReferenceFibers.delete(context)
+    }
+    // A shared registration (agents on one context) reaches this disposal
+    // through each sharing slot; an already-disposed fiber returns nothing or
+    // throws, and either way the section is gone.
+    try {
+      void Promise.resolve(slot.fileReferenceFiber.dispose()).catch(() => {})
+    } catch {
+      /* already disposed through a sharing sibling slot */
+    }
+  }
+
+  // The multi-session registry: one slot per live in-process session, swapped
+  // under this shared chrome. Sessions live with the process by design —
+  // `/resume` remains the door for persisted logs from previous runs.
+  const registry: ChannelRegistry<TuiSessionSlot> = createChannelRegistry<TuiSessionSlot>({
+    buildSlot,
+    mount: mountSlot,
+    unmount: unmountSlot,
+    dispose: disposeSlot,
+    onActiveChange(previous, next) {
+      agent = next.agent
+      channel = next.channel
+      goalBar = next.goalBar
+      queueDock = next.queueDock
+      // The startup path (rebuild, prompt values, initial setStatus) already
+      // covers the first activation; switches refresh the chrome here.
+      if (previous === undefined) return
+      // The switched-in channel was detached while backgrounded: re-derive
+      // its transcript from the log so events it missed render now.
+      next.channel.rebuildTranscript(false)
+      void ctx.sessions.flush(previous.agent.session).catch(() => {})
+      sessionTitle = foldSessionTitle(next.agent.session.events)?.title
       header.invalidate()
       updateTerminalTitle()
-    },
-    onToolResult: () => {
-      fileSearch.invalidate()
-    },
-    applyStatus: (status) => {
-      setStatus(status)
-    },
-    showReasoning: () => showReasoning,
-    toolsVisibility: () => toolsVisibility,
-    onSpinnerFrame: (running, startedAt, label, frame, extras) => {
-      workingLine.update(running, startedAt, label, frame, extras)
+      setStatus(next.agent.status)
+      updatePromptValues()
+      next.goalBar.refresh()
+      refreshQueueDock()
       requestRender()
     },
-    onSpinnerIdle: () => {
-      workingLine.update(false, undefined, undefined, undefined)
-      requestRender()
+    maxLiveSlots: DEFAULT_MAX_LIVE_SLOTS,
+    onEvictionSkipped: (liveCount) => {
+      appendNotice(`Live-session ceiling reached (${liveCount}); every background session is busy, keeping them all.`, 'warning')
     },
-    onAgentError: (stepKey, error) => {
-      liveErrors.add(stepKey)
-      // Full cause chain: wrapper messages like `fetch failed` carry the
-      // actionable transport detail on `cause`.
-      appendNotice(errorChain(error), 'error')
-    },
-    onAgentDisposed: () => {
-      appendNotice(`Agent "${agent.id}" was disposed.`, 'warning')
-      disposed = true
-    },
-  })
-  const chat = channel.chat
-  // The transcript container mounts below the header in the shared layout once
-  // the channel exists; `chat` is per-session state living in a shared slot.
-  ui.children.splice(1, 0, chat)
-  todoContainer.addChild(channel.todo)
+  }, agent)
+
+  /** One `/sessions` row over a live slot: title (or id), status, turns. */
+  const describeSlot = (slot: TuiSessionSlot): SessionChoice => {
+    const idText = displayText(String(slot.sessionId))
+    const shortId = idText.length > 24 ? `${idText.slice(0, 12)}…${idText.slice(-6)}` : idText
+    const title = foldSessionTitle(slot.agent.session.events)?.title
+    const turns = slot.agent.session.events.filter(event => event.type === 'turn/end').length
+    return {
+      sessionId: slot.sessionId,
+      label: title ?? shortId,
+      detail: `${title === undefined ? '' : `${shortId} · `}${slot.agent.status}${turns > 0 ? ` · ${turns} turn${turns === 1 ? '' : 's'}` : ''}`,
+      active: registry.isActive(slot),
+    }
+  }
+
+  let sessionsOverlay: TuiOverlaySession | undefined
+  /** Open the live-session switcher (/sessions). */
+  const showSessions = (): void => {
+    void sessionsOverlay?.close()
+    // Rows keep creation order (the session header's createdAt), so a row's
+    // number stays stable across switches — the LRU order the registry keeps
+    // internally is an eviction concern, not a display one.
+    const rows = registry.slots()
+      .slice()
+      .sort((left, right) =>
+        left.agent.session.header.createdAt - right.agent.session.header.createdAt)
+      .map(describeSlot)
+    const session = overlayManager.open({
+      create: () => new SessionPickerDialog(
+        rows,
+        palette,
+        (choice) => {
+          void session.close()
+          registry.switchTo(choice.sessionId)
+        },
+        () => { void session.close() },
+      ),
+      options: { width: 64, anchor: 'center', margin: 1 },
+    })
+    sessionsOverlay = session
+    void session.closed.then(() => {
+      if (sessionsOverlay === session) sessionsOverlay = undefined
+    })
+    requestRender()
+  }
+
+  /**
+   * Start a fresh in-process session (Ctrl+N, `/new`) and switch to it. The
+   * created agent runs the same loop and routing as the initial one; its slot
+   * mounts under the shared chrome immediately.
+   */
+  const newSession = (): void => {
+    const freshId = SessionId(`session-${randomUUID()}`)
+    void ctx.agents.create({ sessionId: freshId, seed: [], meta: { cwd } }).then(
+      (handle) => {
+        if (disposed) return
+        registry.adopt(handle.agent)
+        showTransientNotice(`New session ${displayText(String(freshId))}.`)
+      },
+      (error: unknown) => {
+        if (!disposed) appendNotice(`New session failed: ${errorChain(error)}`, 'error')
+      },
+    )
+  }
 
   updatePromptValues()
 
@@ -889,31 +1160,13 @@ export function createTuiChat(
     },
   })
 
-  // The keyboard answerer behind `approval/request` — without it, a tool call
-  // the sandbox wants to ask about fails closed ("no approval channel").
-  const approvals = createApprovalAnswerer({
-    ctx,
-    resolved,
-    palette,
-    overlayManager,
-    requestRender,
-    isDisposed,
-    appendNotice,
-    agent,
-    questionMaxHeight: () => {
-      const width = runtime.terminal.columns
-      const editorRows = editor.render(width).length
-      return Math.max(1, Math.min(
-        resolved.questionDialogMaxHeight,
-        runtime.terminal.rows - editorRows,
-      ))
-    },
-    pendingCallLabel: callId => channel.toolCardLabel(callId),
-  })
+  // The keyboard answerer behind `approval/request` lives per-slot in the
+  // channel registry (each slot claims only its own agent's asks).
 
   const resume = createResumeController({
     ctx,
-    agent,
+    // Getter: /resume preflights the mounted session, not the initial one.
+    get agent(): Agent { return agent },
     runtime,
     resolved,
     palette,
@@ -989,8 +1242,9 @@ export function createTuiChat(
       referenceControllers.clear()
       await tuiServiceFiber?.dispose()
       tuiServiceFiber = undefined
-      approvals.drain()
-      approvals.unregister()
+      // Every live slot's approvals drain and unregister together (the
+      // registry's dispose path), mirroring the single-slot shutdown before it.
+      registry.disposeAll()
       questions.rejectAll()
       await overlayManager.dispose()
       modelController.clearOverlay()
@@ -1190,9 +1444,9 @@ export function createTuiChat(
       const input = command.input === undefined ? '' : ` ${command.input.hint}`
       return `/${command.name}${input} — ${command.description}`
     })
-    chat.addChild(new Spacer(1))
-    chat.addChild(new Text(palette.bold(palette.accent('Keyboard shortcuts')), 0, 0))
-    chat.addChild(new Text([
+    channel.chat.addChild(new Spacer(1))
+    channel.chat.addChild(new Text(palette.bold(palette.accent('Keyboard shortcuts')), 0, 0))
+    channel.chat.addChild(new Text([
       'Enter send • Shift/Alt+Enter newline • Up/Down prompt history',
       'Esc cancel turn • Ctrl+O cycle cards (collapse/expand/hide) • Ctrl+R toggle reasoning • Ctrl+L redraw',
       'Shift+Tab cycle permission preset • Ctrl+G goal actions • Ctrl+C cancel/clear/exit • Ctrl+D exit',
@@ -1204,8 +1458,8 @@ export function createTuiChat(
   }
 
   const showPalette = (): void => {
-    chat.addChild(new Spacer(1))
-    chat.addChild(new Text(
+    channel.chat.addChild(new Spacer(1))
+    channel.chat.addChild(new Text(
       renderPalette(palette, currentScheme, resolved.theme.color, paletteOptions()).join('\n'), 0, 0,
     ))
     requestRender()
@@ -1270,14 +1524,14 @@ export function createTuiChat(
       ],
     ]
     const card = new StatusCardComponent(groups, palette)
-    chat.addChild(new Spacer(1))
-    chat.addChild(card)
-    chat.addChild(new Spacer(1))
-    chat.addChild(new Text(palette.bold(palette.accent('System prompt')), 0, 0))
-    chat.addChild(new Text(systemPrompt, 0, 0))
-    chat.addChild(new Spacer(1))
-    chat.addChild(new Text(palette.bold(palette.accent('Registered tools')), 0, 0))
-    chat.addChild(new Text(registeredTools, 0, 0))
+    channel.chat.addChild(new Spacer(1))
+    channel.chat.addChild(card)
+    channel.chat.addChild(new Spacer(1))
+    channel.chat.addChild(new Text(palette.bold(palette.accent('System prompt')), 0, 0))
+    channel.chat.addChild(new Text(systemPrompt, 0, 0))
+    channel.chat.addChild(new Spacer(1))
+    channel.chat.addChild(new Text(palette.bold(palette.accent('Registered tools')), 0, 0))
+    channel.chat.addChild(new Text(registeredTools, 0, 0))
     requestRender()
   }
 
@@ -1351,10 +1605,12 @@ export function createTuiChat(
     : ctx.on('skills/change', () => { refreshSkillCommands(skills) })
   if (skills !== undefined) refreshSkillCommands(skills)
 
-  // The agent scope is minted by agent-loop and intentionally inherits only
-  // that core plugin's dependencies. A child command producer declares its own
-  // UI-service dependency while retaining the parent agent scope and lifetime.
-  const commandFiber = agent.ctx.inject(['commands'], (commandCtx) => {
+  // Front-door commands register GLOBALLY (through this plugin's context, not
+  // the initial agent's): the commands service scopes registrations by the
+  // owning context, and an agent-scoped registration is invisible to every
+  // other live session — `/sessions`, `/new`, and the rest must execute for
+  // whichever session is mounted. The fiber still dies with the TUI.
+  const commandFiber = ctx.inject(['commands'], (commandCtx) => {
     commandCtx.commands.register({
       name: 'help',
       description: 'Show keyboard shortcuts and commands',
@@ -1372,7 +1628,7 @@ export function createTuiChat(
     commandCtx.commands.register({
       name: 'clear',
       description: 'Clear the transcript view (session history is unchanged)',
-      handler: () => { chat.clear(); requestRender(); return { kind: 'success' } },
+      handler: () => { channel.chat.clear(); requestRender(); return { kind: 'success' } },
     })
     commandCtx.commands.register({
       name: 'details',
@@ -1517,17 +1773,19 @@ export function createTuiChat(
       description: 'Exit after the active turn reaches idle',
       handler: exitHandler,
     })
-  })
-  const fileReferencePromptFiber = agent.ctx.inject(['systemPrompt'], (promptCtx) => {
-    promptCtx.systemPrompt.section({
-      name: 'ui:tui-file-reference',
-      order: 99,
-      // Tool visibility can change dynamically or by agent scope. Empty
-      // sections are omitted by renderPrompt, so guidance never names a tool
-      // that this agent cannot call.
-      text: () => agent.ctx.tools.get('read', agent) === undefined ? '' : FILE_REFERENCE_PROMPT,
+    commandCtx.commands.register({
+      name: 'sessions',
+      description: 'List this terminal\'s live sessions and switch between them',
+      handler: () => { showSessions(); return { kind: 'success' } },
+    })
+    commandCtx.commands.register({
+      name: 'new',
+      description: 'Start a fresh session in this terminal and switch to it',
+      handler: () => { newSession(); return { kind: 'success' } },
     })
   })
+  // The @-file reference prompt section registers per-slot (on each agent's
+  // own scope) inside the slot factory.
 
   const runCommand = (text: string): void => {
     const controller = new AbortController()
@@ -1779,6 +2037,12 @@ export function createTuiChat(
       goalBar.showActions()
       return { consume: true }
     }
+    // Ctrl+N starts a fresh in-process session and switches to it (the /new
+    // command's keyboard door); /sessions switches back.
+    if (matchesKey(data, Key.ctrl('n'))) {
+      newSession()
+      return { consume: true }
+    }
     if (matchesKey(data, Key.ctrl('o'))) {
       toggleTools()
       return { consume: true }
@@ -1815,9 +2079,8 @@ export function createTuiChat(
   })
 
   // Every session-scoped listener (session events, inbox/status/error/disposed)
-  // lives on the mounted channel; the shared chrome registers and unregisters
-  // them with the channel itself.
-  channel.attach()
+  // lives on the mounted channel; the registry's mount/unmount attach and
+  // detach them with the slot itself. The initial slot is already attached.
 
   const detachListeners = (): void => {
     skillAbort.abort()
@@ -1830,9 +2093,10 @@ export function createTuiChat(
     for (const value of promptValues) value.dispose()
     stopBannerReveal()
     stopLogoShimmer()
-    channel.detach()
+    // Every live slot tears down together: session listeners, per-slot
+    // approvals/docks, agent-scoped model routing and prompt sections.
+    registry.disposeAll()
     disposeSchemeListener()
-    disposeTargetListeners()
     modelController.detach()
   }
 
@@ -1918,10 +2182,7 @@ export function createTuiChat(
   } catch (error: unknown) {
     disposed = true
     detachListeners()
-    void Promise.all([
-      commandFiber.dispose(),
-      fileReferencePromptFiber.dispose(),
-    ]).catch(
+    void commandFiber.dispose().catch(
       /* v8 ignore next 2 -- command registration cleanup is non-throwing; this guards a future disposer regression */
       (cleanupError: unknown) => {
         ctx.logger.warn(`ui-tui: scoped cleanup after startup failure failed: ${errorChain(cleanupError)}`)
@@ -1929,8 +2190,6 @@ export function createTuiChat(
     )
     clearStatus()
     clearInterval(spinnerTimer)
-    approvals.drain()
-    approvals.unregister()
     questions.unregister()
     ui.stop()
     throw error
@@ -1957,10 +2216,7 @@ export function createTuiChat(
     async dispose(): Promise<void> {
       detachListeners()
       await shutdown(false)
-      await Promise.all([
-        commandFiber.dispose(),
-        fileReferencePromptFiber.dispose(),
-      ])
+      await commandFiber.dispose()
     },
   }
 }

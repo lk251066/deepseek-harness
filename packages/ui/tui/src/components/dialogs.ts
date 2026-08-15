@@ -599,6 +599,82 @@ export class DetailsDialog implements Component {
   }
 }
 
+/** One `/sessions` picker row: one live in-process session. */
+export interface SessionChoice {
+  /** The session the row switches to when chosen. */
+  sessionId: SessionId
+  /** Row label: the session's title, or its id when untitled. */
+  label: string
+  /** Secondary detail: the id when titled, plus agent status and turn count. */
+  detail: string
+  /** Whether this row is the currently mounted session. */
+  active: boolean
+}
+
+/**
+ * Keyboard switcher over the live in-process sessions: ↑/↓ move, Enter or a
+ * digit 1-9 picks a rendered row and switches the mounted channel, Esc or
+ * Ctrl+C closes without switching. The active row stays selectable but a
+ * no-op (the requested state already holds).
+ */
+export class SessionPickerDialog implements Component {
+  private selectedIndex = 0
+
+  constructor(
+    private readonly choices: readonly SessionChoice[],
+    private readonly palette: Palette,
+    private readonly choose: (choice: SessionChoice) => void,
+    private readonly close: () => void,
+  ) {}
+
+  invalidate(): void {}
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl('c'))) {
+      this.close()
+      return
+    }
+    if (this.choices.length === 0) return
+    const digit = digitIndex(data)
+    if (digit !== undefined && digit < this.choices.length) {
+      this.choose(this.choices[digit] as SessionChoice)
+      return
+    }
+    if (matchesKey(data, Key.up)) {
+      this.selectedIndex = this.selectedIndex === 0 ? this.choices.length - 1 : this.selectedIndex - 1
+    } else if (matchesKey(data, Key.down)) {
+      this.selectedIndex = this.selectedIndex === this.choices.length - 1 ? 0 : this.selectedIndex + 1
+    } else if (matchesKey(data, Key.return)) {
+      this.choose(this.choices[this.selectedIndex] as SessionChoice)
+    }
+  }
+
+  render(width: number): string[] {
+    const innerWidth = Math.max(1, width - 4)
+    if (this.choices.length === 0) {
+      return renderDialog('Sessions', [
+        this.palette.dim('No live sessions besides this one.'),
+        '',
+        this.palette.dim('Ctrl+N or /new starts one.'),
+      ], width, this.palette, { frame: 'topline' })
+    }
+    const rows = this.choices.map((choice, index) => {
+      const number = this.palette.dim(`${index + 1}.`)
+      const marker = choice.active ? this.palette.accent('●') : ' '
+      const label = choice.active ? this.palette.accent(choice.label) : choice.label
+      // The highlight is a glyph prefix, not an SGR wrap: escape sequences
+      // cannot nest, so bolding a styled row would reset its inner colors.
+      const caret = index === this.selectedIndex ? this.palette.accent('❯') : ' '
+      return `${caret}${truncateToWidth(`${number} ${marker} ${label} ${this.palette.dim(choice.detail)}`, Math.max(1, innerWidth - 1), '')}`
+    })
+    return renderDialog('Sessions', [
+      ...rows,
+      '',
+      this.palette.dim('↑/↓ move • Enter or 1-9 switch • Esc close'),
+    ], width, this.palette, { frame: 'topline' })
+  }
+}
+
 /** One `/theme` picker row. */
 export interface ThemeChoice {
   name: string

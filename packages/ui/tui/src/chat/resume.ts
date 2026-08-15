@@ -59,9 +59,16 @@ export interface ResumeController {
  */
 export function createResumeController(deps: ResumeControllerDeps): ResumeController {
   const {
-    ctx, agent, runtime, resolved, palette, overlayManager,
+    ctx, runtime, resolved, palette, overlayManager,
     sessionQuery, ui, editor,
   } = deps
+  /**
+   * The agent resume preflights against, re-read per use: a multi-session
+   * host routes `deps.agent` to the currently mounted slot, so the idle gate,
+   * the flush, and the workspace scope always speak about the session on
+   * screen, not the one this process started on.
+   */
+  const agent = (): Agent => deps.agent
   let resumeOverlay: TuiOverlaySession | undefined
   let resumeInFlight = false
   let resumeScan = 0
@@ -79,8 +86,8 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
     record,
     title,
     lastActivityAt,
-    agent.session.id,
-    agent.session.header.cwd,
+    agent().session.id,
+    agent().session.header.cwd,
     workspaceLabel,
   )
 
@@ -93,7 +100,7 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
     record,
     title: 'Unreadable session',
     lastActivityAt: lastActivityAt ?? record.header.createdAt,
-    currentWorkspace: record.header.cwd === agent.session.header.cwd,
+    currentWorkspace: record.header.cwd === agent().session.header.cwd,
     workspaceLabel: workspaceLabel(record.header.cwd),
     disabledReason: `session cannot be loaded: ${errorChain(error)}`,
   })
@@ -246,10 +253,10 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
       }
       /* v8 ignore next -- shutdown during preflight invalidates an awaited service read or reaches this guard */
       if (deps.isDisposed()) return
-      await ctx.sessions.flush(agent.session)
+      await ctx.sessions.flush(agent().session)
       // Disposal can run while the flush promise is pending.
       if (deps.isDisposed()) return
-      if (agent.status !== 'idle') throw new Error(`Resume requires an idle agent (status: ${agent.status}).`)
+      if (agent().status !== 'idle') throw new Error(`Resume requires an idle agent (status: ${agent().status}).`)
       await overlay.close()
       resumeOverlay = undefined
       await runtime.terminal.drainInput(100, 20)
@@ -281,7 +288,7 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
 
   return {
     showResume(): void {
-      if (agent.status !== 'idle') {
+      if (agent().status !== 'idle') {
         deps.appendNotice('Resume requires the current turn to finish or be cancelled first.', 'warning')
         return
       }
@@ -303,7 +310,7 @@ export function createResumeController(deps: ResumeControllerDeps): ResumeContro
           picker = new ResumePicker(
             scanned,
             resolved.maxResumeOptions,
-            workspaceLabel(agent.session.header.cwd),
+            workspaceLabel(agent().session.header.cwd),
             () => host.viewport.rows,
             palette,
             (candidate) => { void handoffResume(candidate, session) },

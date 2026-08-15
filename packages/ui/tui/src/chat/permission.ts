@@ -52,7 +52,13 @@ export interface PermissionController {
  * @returns the controller wired into the input listener and prompt values.
  */
 export function createPermissionController(deps: PermissionDeps): PermissionController {
-  const { ctx, agent } = deps
+  const { ctx } = deps
+  /**
+   * The mounted agent, re-read per use: a multi-session host routes
+   * `deps.agent` to the currently mounted slot, so the ring always cycles the
+   * session on screen.
+   */
+  const agent = (): Agent => deps.agent
   const presets = (): PermissionPresetsService | undefined =>
     ctx.get('permissionPresets')
 
@@ -60,7 +66,7 @@ export function createPermissionController(deps: PermissionDeps): PermissionCont
     const service = presets()
     if (service === undefined) return
     try {
-      service.set(agent.session, name)
+      service.set(agent().session, name)
       const option = service.resolve(name)
       deps.appendNotice(`Permission preset: ${option.description ?? name}`)
     } catch (error) {
@@ -77,7 +83,7 @@ export function createPermissionController(deps: PermissionDeps): PermissionCont
       }
       const names = service.names
       if (names.length === 0) return
-      const index = names.indexOf(service.current(agent.session.events))
+      const index = names.indexOf(service.current(agent().session.events))
       // `custom` (index -1) restarts the ring from the most restrictive entry.
       const next = names[(index + 1 + names.length) % names.length] ?? names[0]
       if (next === undefined) return
@@ -93,7 +99,7 @@ export function createPermissionController(deps: PermissionDeps): PermissionCont
     },
     chip(): string | undefined {
       const service = presets()
-      return service === undefined ? undefined : service.current(agent.session.events)
+      return service === undefined ? undefined : service.current(agent().session.events)
     },
   }
 }

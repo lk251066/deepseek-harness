@@ -115,6 +115,7 @@ export const PROFILE_TEMPLATES: Record<string, readonly string[]> = {
   web: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
   headless: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'],
   tui: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-tui-bundle'],
+  acp: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-acp-bundle'],
 }
 
 /** Installation-owned bundle tuples normalized to the shipped template. */

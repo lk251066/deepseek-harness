@@ -1,0 +1,23 @@
+{
+  "name": "@deepseek-ai/dsh-acp-bundle",
+  "description": "The dsh ACP server bundle: serve this harness over the Agent Client Protocol on stdio, over dsh-base",
+  "version": "0.1.0-rc.5",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-acp": "workspace:^"
+  }
+}

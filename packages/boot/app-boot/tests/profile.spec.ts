@@ -161,6 +161,18 @@ describe('loadProfile', () => {
       .toEqual([...PROFILE_TEMPLATES.web ?? []])
   })
 
+  it('auto-initializes the acp template (the ACP server profile)', () => {
+    const anchor = stageInstallation({
+      '@deepseek-ai/dsh-base': { patch: '[]\n' },
+      '@deepseek-ai/dsh-acp-bundle': { patch: '[]\n' },
+    })
+    const home = tmp()
+    expect(PROFILE_TEMPLATES.acp).toEqual(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-acp-bundle'])
+    loadProfile('t', 'acp', anchor, home)
+    expect(readProfileManifest('t', resolveProfileDir('acp', home)).dsh?.profile?.bundles)
+      .toEqual([...PROFILE_TEMPLATES.acp ?? []])
+  })
+
   it('normalizes only the exact installation-owned headless bundle tuple', () => {
     const anchor = stageInstallation({
       '@deepseek-ai/dsh-base': { patch: '[]\n' },

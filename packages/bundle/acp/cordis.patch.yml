@@ -1,0 +1,23 @@
+# The dsh-acp-bundle patch: serve this dsh over the Agent Client Protocol.
+# Applied after dsh-base's insert; rows here override base rows by id, with
+# the profile's own cordis.patch.yml and any --patch overlays still to come.
+#
+# The ACP surface composes its agents per protocol session (dsh-acp creates
+# one agent per `session/new`), so it keeps base's empty agent roster — no
+# boot agent, no interactive front door. stdout belongs to the JSON-RPC
+# stream, so module-reload HMR stays off (the launcher's watch-only fallback
+# keeps user patch layers live through stderr).
+
+- id: hmr
+  disabled: true
+
+- insert:
+    # The stdio ACP bridge: initialize / session/new / session/prompt /
+    # session/cancel, with permission asks relayed to the client. Provider and
+    # model route every ACP-created agent; a deployment pins them through the
+    # environment or a later patch layer.
+    - id: acp
+      name: '@deepseek-ai/dsh-acp'
+      config:
+        provider: !!js process.env.DSH_ACP_PROVIDER ?? 'deepseek-official'
+        model: !!js process.env.DSH_ACP_MODEL ?? 'deepseek-v4-flash'

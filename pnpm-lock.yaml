@@ -142,6 +142,9 @@ importers:
       '@deepseek-ai/cordis-plugin-timer':
         specifier: workspace:^
         version: link:../../vendor/timer
+      '@deepseek-ai/dsh-acp-bundle':
+        specifier: workspace:^
+        version: link:../../packages/bundle/acp
       '@deepseek-ai/dsh-agent-instructions':
         specifier: workspace:^
         version: link:../../packages/context/agent-instructions
@@ -990,6 +993,12 @@ importers:
       commander:
         specifier: ^15.0.0
         version: 15.0.0
+
+  packages/bundle/acp:
+    dependencies:
+      '@deepseek-ai/dsh-acp':
+        specifier: workspace:^
+        version: link:../../acp/acp
 
   packages/bundle/base:
     dependencies:

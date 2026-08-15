@@ -31,15 +31,27 @@ describe('ACP machine permission policy', () => {
     await expect(harness.ctx.approval.request(request)).resolves.toBe('allowed-once')
     expect(harness.permissionRequests[0]).toMatchObject({
       sessionId: request.agent.session.id,
-      toolCall: { toolCallId: 'call-9' },
+      // The tool's name rides the title; with no reason configured, no _meta.
+      toolCall: { toolCallId: 'call-9', title: 'bash' },
       options: [
         { optionId: 'allow-once', kind: 'allow_once' },
         { optionId: 'reject-once', kind: 'reject_once' },
       ],
     })
+    expect((harness.permissionRequests[0]!.toolCall as { _meta?: unknown })._meta).toBeUndefined()
 
     harness.onPermission = () => ({ outcome: { outcome: 'selected', optionId: 'reject-once' } })
     await expect(harness.ctx.approval.request(request)).resolves.toBe('rejected')
+  })
+
+  it('forwards the ask reason through the protocol-reserved _meta', async () => {
+    harness = await makeBridgeHarness()
+    harness.onPermission = () => ({ outcome: { outcome: 'cancelled' } })
+    const request = await ownedRequest({ reason: 'touch /etc/passwd' })
+    await expect(harness.ctx.approval.request(request)).resolves.toBe('cancelled')
+    expect(harness.permissionRequests[0]).toMatchObject({
+      toolCall: { toolCallId: 'call-9', title: 'bash', _meta: { reason: 'touch /etc/passwd' } },
+    })
   })
 
   it('maps cancellation and unknown choices without granting access', async () => {

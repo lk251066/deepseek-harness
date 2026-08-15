@@ -211,13 +211,20 @@ export function apply(ctx: Context, config: AcpConfig): void {
 
   // Permission requests are a machine policy channel for ACP clients such as
   // dsh-subagent-acp. The bridge offers one-shot choices only and never infers a
-  // durable grant from an unknown client response.
+  // durable grant from an unknown client response. The tool's name rides the
+  // toolCall title and the ask's reason rides the protocol-reserved `_meta`,
+  // so a human-relaying client (subagent-acp's `ask` policy) can present WHAT
+  // the remote tool wants to do, not just an opaque call id.
   ctx.on('approval/request', (request, next) => {
     const record = ownedRecord(request.agent)
     if (record === undefined || request.callId === undefined) return next()
     return conn.requestPermission({
       sessionId: record.agent.session.id,
-      toolCall: { toolCallId: request.callId },
+      toolCall: {
+        toolCallId: request.callId,
+        title: request.toolName,
+        ...(request.reason === undefined ? {} : { _meta: { reason: request.reason } }),
+      },
       options: [
         { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
         { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },

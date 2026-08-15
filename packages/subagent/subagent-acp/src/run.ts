@@ -38,11 +38,22 @@ export interface AcpRunSpec {
   /** Arguments passed to {@link command}. */
   args: string[]
   /**
-   * Absolute working directory for the child process AND its ACP session
-   * `cwd`. The provider resolves it before this spec exists: config override,
-   * else the delegating parent session's workspace.
+   * Working directory handed to the child's ACP `session/new` — the child
+   * agent's workspace. In a local world this is also the spawn anchor; in a
+   * remote world (wsl/ssh transport) it is a REMOTE path the local process
+   * cannot enter, and {@link spawnCwd} carries the local anchor instead. The
+   * provider resolves it before this spec exists: config override, else the
+   * delegating parent session's workspace.
    */
   cwd: string
+  /**
+   * Absolute LOCAL working directory for the spawned transport process. A
+   * remote transport (`wsl`, `ssh`) runs locally and cannot chdir into the
+   * remote session world, so the provider anchors it at the harness process
+   * cwd instead; a local child uses the session cwd itself (byte-identical
+   * to the pre-remote-era behavior).
+   */
+  spawnCwd: string
   /** How to auto-answer the child's permission prompts. */
   permission: PermissionPolicy
   /**
@@ -208,7 +219,7 @@ export async function startAcpRun(request: SubagentStartRequest, spec: AcpRunSpe
   // while spec.env (the child's own key, its deployment facts) merges after it.
   const child = spec.spawn({
     argv: [spec.command, ...spec.args],
-    cwd: spec.cwd,
+    cwd: spec.spawnCwd,
     stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'inherit' },
     graceMs: spec.disposeGraceMs,
     env: spec.env,

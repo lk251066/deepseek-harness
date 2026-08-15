@@ -33,12 +33,23 @@ export interface Config {
   args: string[]
   /**
    * Working directory override for the child process and its ACP session.
-   * Must be non-empty; a relative path resolves against the harness launch
-   * directory at load, and the result must be an existing directory. When
-   * omitted, each child inherits its delegating parent session's cwd — and
-   * starting one from a parent session that has no cwd fails.
+   * In a `local` world must be non-empty; a relative path resolves against
+   * the harness launch directory at load, and the result must be an existing
+   * directory. When omitted, each child inherits its delegating parent
+   * session's cwd — and starting one from a parent session that has no cwd
+   * fails. In a `remote` world the value is a REMOTE path (see
+   * {@link cwdWorld}) and is required.
    */
   cwd?: string
+  /**
+   * Which machine `cwd` names. `local` (default): the path is a local
+   * directory the child process enters directly. `remote`: the child is a
+   * transport process (`wsl`, `ssh`) — `cwd` is the REMOTE workspace handed
+   * to the child agent's ACP session, syntactically validated only (the
+   * local host cannot stat it), and REQUIRED (the delegating parent's cwd is
+   * local-machine semantics and must not leak into a remote world).
+   */
+  cwdWorld: 'local' | 'remote'
   /**
    * How to auto-answer the child's `session/request_permission` prompts:
    * `reject` (default — decline every prompt) or `allow` (approve via the first
@@ -68,6 +79,7 @@ export const Config: z<Config> = z.object({
   command: z.string().required(),
   args: z.array(z.string()).default([]),
   cwd: z.string(),
+  cwdWorld: z.union(['local', 'remote'] as const).default('local'),
   permission: z.union(['allow', 'reject'] as const).default('reject'),
   env: z.dict(z.string()).default({}),
   disposeEofGraceMs: z.number().default(DEFAULT_DISPOSE_EOF_GRACE_MS),
@@ -139,6 +151,37 @@ function resolveCwd(configured: string | undefined, request: SubagentStartReques
 }
 
 /**
+ * Absolute in a REMOTE world: a posix path (`/home/...`), a Windows drive
+ * (`C:\...` / `C:/...`), or a UNC path (`\\server\share\...`). Syntactic only
+ * — the local host cannot stat the remote machine's directories, so load-time
+ * validation stops at the shape and the child's own `session/new` remains the
+ * authority on whether the workspace exists.
+ */
+function isRemoteAbsolute(path: string): boolean {
+  return path.startsWith('/')
+    || path.startsWith('\\\\')
+    || /^[A-Za-z]:[\\/]/u.test(path)
+}
+
+/**
+ * Validate a `remote`-world configured cwd: non-empty, syntactically absolute
+ * on the remote machine, never relative (a relative path must NOT be resolved
+ * against the local launch directory — that would silently inject a local
+ * directory into a remote workspace declaration).
+ * @param cwd - the configured remote workspace path.
+ * @returns `cwd`, validated.
+ */
+function assertRemoteCwd(cwd: string): string {
+  if (cwd === '') {
+    throw new Error('subagent-acp: config cwd must not be empty')
+  }
+  if (!isRemoteAbsolute(cwd)) {
+    throw new Error(`subagent-acp: remote cwdWorld requires an absolute remote path: ${cwd}`)
+  }
+  return cwd
+}
+
+/**
  * The ACP provider. Advertises NO start-time capabilities: an out-of-process
  * child cannot honor `outputSchema`/`maxDepth`/`toolFilter` (the service rejects
  * a request needing any of them before `start` runs).
@@ -151,10 +194,18 @@ class AcpProvider implements SubagentProvider {
   constructor(readonly name: string, private readonly ctx: Context, private readonly config: ResolvedConfig) {}
 
   start(request: ResolvedSubagentStartRequest) {
+    // Two cwd roles: the ACP session workspace (world-specific) and the local
+    // spawn anchor. A local child enters its session cwd directly; a remote
+    // transport (`wsl`, `ssh`) runs locally and anchors at the harness cwd
+    // while the session cwd names the REMOTE workspace.
+    const sessionCwd = this.config.cwdWorld === 'remote'
+      ? this.remoteSessionCwd()
+      : resolveCwd(this.config.cwd, request)
     const spec: AcpRunSpec = {
       command: this.config.command,
       args: this.config.args,
-      cwd: resolveCwd(this.config.cwd, request),
+      cwd: sessionCwd,
+      spawnCwd: this.config.cwdWorld === 'remote' ? process.cwd() : sessionCwd,
       permission: this.config.permission,
       env: this.config.env,
       disposeEofGraceMs: this.config.disposeEofGraceMs,
@@ -168,6 +219,14 @@ class AcpProvider implements SubagentProvider {
     }
     return startAcpRun(request, spec)
   }
+
+  /** The load-validated remote workspace; the guard below is unreachable in a composed deployment. */
+  private remoteSessionCwd(): string {
+    const cwd = this.config.cwd
+    /* v8 ignore next -- apply() rejects a remote world without a configured cwd before a provider exists. */
+    if (cwd === undefined) throw new Error('subagent-acp: remote cwdWorld requires a configured cwd')
+    return cwd
+  }
 }
 
 export function apply(ctx: Context, config: Config): void {
@@ -175,6 +234,19 @@ export function apply(ctx: Context, config: Config): void {
   const resolved = config as ResolvedConfig
   assertPositiveFinite('disposeEofGraceMs', resolved.disposeEofGraceMs)
   assertPositiveFinite('disposeGraceMs', resolved.disposeGraceMs)
+  // A remote world is purely syntactic at load: the path names a directory on
+  // ANOTHER machine, so the local stat does not apply, and the delegating
+  // parent's (local-machine) cwd must not be inherited into it.
+  if (resolved.cwdWorld === 'remote') {
+    if (resolved.cwd === undefined) {
+      throw new Error('subagent-acp: remote cwdWorld requires a configured cwd — the parent session cwd is local-machine semantics and cannot name a remote workspace')
+    }
+    ctx.subagents.registerProvider(new AcpProvider(resolved.providerName, ctx, {
+      ...resolved,
+      cwd: assertRemoteCwd(resolved.cwd),
+    }))
+    return
+  }
   // `path.resolve('')` is the process cwd — an empty string would silently
   // reintroduce the launch-directory fallback this resolution removed.
   if (resolved.cwd === '') {

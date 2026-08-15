@@ -41,7 +41,7 @@ interface SetupEnv {
  * Mount the ACP backend pointed at the mock server, scripted by `mockEnv`.
  * `permission` selects the backend's auto-answer policy.
  */
-async function setup(mockEnv: SetupEnv = {}, permission: 'allow' | 'reject' = 'reject') {
+async function setup(mockEnv: SetupEnv = {}, permission: 'allow' | 'reject' = 'reject', overrides: Record<string, unknown> = {}) {
   const ctx = new Context()
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(LocalSubprocessRuntime)
@@ -51,7 +51,8 @@ async function setup(mockEnv: SetupEnv = {}, permission: 'allow' | 'reject' = 'r
     args: [mockServer],
     permission,
     env: mockEnv,
-  })
+    ...overrides,
+  } as acp.Config)
   return ctx
 }
 
@@ -217,6 +218,73 @@ describe('cwd resolution', () => {
     }
   })
 
+  it('remote world: spawns locally anchored while the ACP session names the remote workspace', async () => {
+    // A path that provably does not exist on THIS machine — load must still
+    // accept it (no local stat), and the child must receive it as the
+    // session workspace while its PROCESS runs at the harness anchor.
+    const remoteWorkspace = '/home/nobody/remotely-absent-project'
+    const ctx = await setup({ MOCK_ECHO_CWD: '1' }, 'reject', {
+      cwdWorld: 'remote',
+      cwd: remoteWorkspace,
+    })
+    const parent = { id: 'parent', session: { header: { cwd: process.cwd() } } } as unknown as Agent
+    const run = await ctx.subagents.start('acp', { prompt: [{ type: 'text' as const, text: 'p' }], parent, signal: new AbortController().signal })
+    const result = await run.result
+    await run.dispose()
+    // Line 1: the child process's real cwd (the local anchor); line 2: the
+    // remote workspace announced in `session/new`.
+    expect(text(result.output)).toBe(`${process.cwd()}
+${remoteWorkspace}`)
+  })
+
+  it('remote world: accepts a Windows-drive remote path (ssh to a Windows host)', async () => {
+    const ctx = await setup({}, 'reject', { cwdWorld: 'remote', cwd: 'C:\\remote\\proj' })
+    expect(ctx).toBeDefined()
+  })
+
+  it('remote world: rejects a missing or relative cwd at load, before any provider exists', async () => {
+    const missing = new Context()
+    await missing.plugin(SubagentRuntime)
+    await missing.plugin(LocalSubprocessRuntime)
+    await expect(missing.plugin(acp, {
+      providerName: 'acp',
+      command: process.execPath,
+      args: [mockServer],
+      permission: 'reject',
+      env: {},
+      cwdWorld: 'remote',
+    })).rejects.toThrow('remote cwdWorld requires a configured cwd')
+    await missing.fiber.dispose()
+
+    const relative = new Context()
+    await relative.plugin(SubagentRuntime)
+    await relative.plugin(LocalSubprocessRuntime)
+    await expect(relative.plugin(acp, {
+      providerName: 'acp',
+      command: process.execPath,
+      args: [mockServer],
+      permission: 'reject',
+      env: {},
+      cwdWorld: 'remote',
+      cwd: 'relative/proj',
+    })).rejects.toThrow('absolute remote path: relative/proj')
+    await relative.fiber.dispose()
+
+    const empty = new Context()
+    await empty.plugin(SubagentRuntime)
+    await empty.plugin(LocalSubprocessRuntime)
+    await expect(empty.plugin(acp, {
+      providerName: 'acp',
+      command: process.execPath,
+      args: [mockServer],
+      permission: 'reject',
+      env: {},
+      cwdWorld: 'remote',
+      cwd: '',
+    })).rejects.toThrow('config cwd must not be empty')
+    await empty.fiber.dispose()
+  })
+
   it('rejects before spawning when neither config.cwd nor the parent session provides one', async () => {
     const tmp = mkdtempSync(join(tmpdir(), 'acp-no-cwd-'))
     const sentinel = join(tmp, 'spawned')
@@ -225,7 +293,7 @@ describe('cwd resolution', () => {
       await ctx.plugin(SubagentRuntime)
       await ctx.plugin(LocalSubprocessRuntime)
       // A command that would create the sentinel if the child were ever spawned.
-      await ctx.plugin(acp, { providerName: 'acp', command: 'touch', args: [sentinel], permission: 'reject', env: {} })
+      await ctx.plugin(acp, { providerName: 'acp', command: 'touch', args: [sentinel], cwdWorld: 'local', permission: 'reject', env: {} })
       const parent = { id: 'parent', session: { header: {} } } as unknown as Agent
       await expect(ctx.subagents.start('acp', { prompt: [{ type: 'text' as const, text: 'p' }], parent, signal: new AbortController().signal }))
         .rejects.toThrow('no working directory')
@@ -248,6 +316,7 @@ describe('cwd resolution', () => {
         command: process.execPath,
         args: [mockServer],
         cwd: configured,
+        cwdWorld: 'local',
         permission: 'reject',
         env: { MOCK_ECHO_CWD: '1' },
       })
@@ -276,6 +345,7 @@ describe('cwd resolution', () => {
       command: process.execPath,
       args: [mockServer],
       cwd: relative,
+      cwdWorld: 'local',
       permission: 'reject',
       env: { MOCK_ECHO_CWD: '1' },
     })
@@ -296,6 +366,7 @@ describe('cwd resolution', () => {
       command: 'true',
       args: [],
       cwd: '',
+      cwdWorld: 'local',
       permission: 'reject',
       env: {},
     })).rejects.toThrow('config cwd must not be empty')
@@ -317,6 +388,7 @@ describe('cwd resolution', () => {
         command: 'true',
         args: [],
         cwd: tmp,
+        cwdWorld: 'local',
         permission: 'reject',
         env: {},
       })).rejects.toThrow('not an accessible directory')
@@ -336,6 +408,7 @@ describe('cwd resolution', () => {
       command: 'true',
       args: [],
       cwd: '/nonexistent/acp-child-workspace',
+      cwdWorld: 'local',
       permission: 'reject',
       env: {},
     })).rejects.toThrow('not an accessible directory')
@@ -373,7 +446,7 @@ describe('cwd resolution', () => {
       const ctx = new Context()
       await ctx.plugin(SubagentRuntime)
       await ctx.plugin(LocalSubprocessRuntime)
-      await ctx.plugin(acp, { providerName: 'acp', command: 'touch', args: [sentinel], permission: 'reject', env: {} })
+      await ctx.plugin(acp, { providerName: 'acp', command: 'touch', args: [sentinel], cwdWorld: 'local', permission: 'reject', env: {} })
       const parent = { id: 'parent', session: { header: { cwd: join(tmp, 'vanished') } } } as unknown as Agent
       await expect(ctx.subagents.start('acp', { prompt: [{ type: 'text' as const, text: 'p' }], parent, signal: new AbortController().signal }))
         .rejects.toThrow('not an accessible directory')
@@ -450,7 +523,7 @@ describe('dsh-subagent-acp', () => {
       await expect(startAcpRun(
         request('p', controller.signal),
         // `touch <sentinel>` — runs only if the process is actually spawned.
-        { command: 'touch', args: [sentinel], cwd: tmp, permission: 'reject', env: {}, disposeEofGraceMs: DEFAULT_DISPOSE_EOF_GRACE_MS, disposeGraceMs: DEFAULT_DISPOSE_GRACE_MS, spawn: spawnSubprocess },
+        { command: 'touch', args: [sentinel], cwd: tmp, spawnCwd: tmp, permission: 'reject', env: {}, disposeEofGraceMs: DEFAULT_DISPOSE_EOF_GRACE_MS, disposeGraceMs: DEFAULT_DISPOSE_GRACE_MS, spawn: spawnSubprocess },
       )).rejects.toThrow('aborted before the ACP child started')
       // The binary was never launched — no sentinel.
       expect(existsSync(sentinel)).toBe(false)
@@ -467,6 +540,7 @@ describe('dsh-subagent-acp', () => {
         command: process.execPath,
         args: [mockServer],
         cwd: process.cwd(),
+        spawnCwd: process.cwd(),
         permission: 'reject',
         env: {
           MOCK_MISSING_SESSION_ID: '1',
@@ -496,6 +570,7 @@ describe('dsh-subagent-acp', () => {
         command: process.execPath,
         args: [mockServer],
         cwd: process.cwd(),
+        spawnCwd: process.cwd(),
         permission: 'reject',
         env: { MOCK_TRAP_SIGTERM: '1', MOCK_TEXT: 'x', MOCK_READY_FILE: ready },
         // Short on BOTH tiers: the trap ignores EOF and SIGTERM, so dispose must
@@ -540,6 +615,7 @@ describe('dsh-subagent-acp', () => {
         command: process.execPath,
         args: [mockServer],
         cwd: process.cwd(),
+        spawnCwd: process.cwd(),
         permission: 'reject',
         // MOCK_HANG so the prompt never resolves on its own — we tear down a live
         // child. The flush beat (400ms) outlasts the 50ms SIGTERM grace but fits
@@ -577,6 +653,7 @@ describe('dsh-subagent-acp', () => {
         command: process.execPath,
         args: [mockServer],
         cwd: process.cwd(),
+        spawnCwd: process.cwd(),
         permission: 'reject',
         env: {
           MOCK_HANG: '1', MOCK_IGNORE_EOF: '1', MOCK_TEXT: 'x',
@@ -681,7 +758,7 @@ describe('dsh-subagent-acp', () => {
   it('rejects a spawn failure after provider-owned cleanup', async () => {
     await expect(startAcpRun(
       request(),
-      { command: '/nonexistent/acp-agent-binary', args: [], cwd: process.cwd(), permission: 'reject', env: {}, disposeEofGraceMs: DEFAULT_DISPOSE_EOF_GRACE_MS, disposeGraceMs: DEFAULT_DISPOSE_GRACE_MS, spawn: spawnSubprocess },
+      { command: '/nonexistent/acp-agent-binary', args: [], cwd: process.cwd(), spawnCwd: process.cwd(), permission: 'reject', env: {}, disposeEofGraceMs: DEFAULT_DISPOSE_EOF_GRACE_MS, disposeGraceMs: DEFAULT_DISPOSE_GRACE_MS, spawn: spawnSubprocess },
     )).rejects.toThrow()
   })
 
@@ -700,6 +777,7 @@ describe('dsh-subagent-acp', () => {
         providerName: 'acp',
         command: process.execPath,
         args: [mockServer],
+        cwdWorld: 'local',
         permission: 'reject',
         env: { MOCK_TRAP_SIGTERM: '1', MOCK_TEXT: 'x', MOCK_READY_FILE: ready },
         disposeEofGraceMs: 150,
@@ -729,7 +807,7 @@ describe('dsh-subagent-acp', () => {
       const ctx = new Context()
       await ctx.plugin(SubagentRuntime)
       await ctx.plugin(LocalSubprocessRuntime)
-      await expect(ctx.plugin(acp, { providerName: 'acp', command: 'true', args: [], permission: 'reject', env: {}, ...bad }))
+      await expect(ctx.plugin(acp, { providerName: 'acp', command: 'true', args: [], cwdWorld: 'local', permission: 'reject', env: {}, ...bad }))
         .rejects.toThrow(new RegExp(`subagent-acp: dispose(?:Eof)?GraceMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`))
       await ctx.fiber.dispose()
     }
@@ -743,6 +821,7 @@ describe('dsh-subagent-acp', () => {
       providerName: 'acp',
       command: '/nonexistent/acp-agent-binary',
       args: [],
+      cwdWorld: 'local',
       permission: 'reject',
       env: {},
     })
@@ -761,6 +840,7 @@ describe('dsh-subagent-acp', () => {
         command: process.execPath,
         args: [mockServer],
         cwd: process.cwd(),
+        spawnCwd: process.cwd(),
         permission: 'reject',
         env: { MOCK_CRASH_ON_PROMPT: '1' },
         disposeEofGraceMs: DEFAULT_DISPOSE_EOF_GRACE_MS,
@@ -800,6 +880,7 @@ describe('dsh-subagent-acp', () => {
         command: process.execPath,
         args: [mockServer],
         cwd: process.cwd(),
+        spawnCwd: process.cwd(),
         permission: 'reject',
         env: { MOCK_CRASH_ON_PROMPT: '1' },
         disposeEofGraceMs: DEFAULT_DISPOSE_EOF_GRACE_MS,
@@ -870,7 +951,7 @@ describe('dsh-subagent-acp', () => {
     const ctx = new Context()
     await ctx.plugin(SubagentRuntime)
     await ctx.plugin(LocalSubprocessRuntime)
-    const fiber = await ctx.plugin(acp, { providerName: 'acp', command: 'x', args: [], permission: 'reject', env: {} })
+    const fiber = await ctx.plugin(acp, { providerName: 'acp', command: 'x', args: [], cwdWorld: 'local', permission: 'reject', env: {} })
     expect(ctx.subagents.list()).toEqual(['acp'])
     await fiber.dispose()
     expect(ctx.subagents.list()).toEqual([])

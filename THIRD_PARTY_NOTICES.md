@@ -54,6 +54,7 @@ External packages that a workspace package resolves at runtime. The tier covers 
 | [`@xterm/headless`](https://github.com/xtermjs/xterm.js) | MIT |
 | [`anser`](https://github.com/IonicaBizau/anser) | MIT |
 | [`chokidar`](https://github.com/paulmillr/chokidar) | MIT |
+| [`cli-highlight`](https://github.com/felixfbecker/cli-highlight) | ISC |
 | [`clsx`](https://github.com/lukeed/clsx) | MIT |
 | [`commander`](https://github.com/tj/commander.js) | MIT |
 | [`diff`](https://github.com/kpdecker/jsdiff) | BSD-3-Clause |

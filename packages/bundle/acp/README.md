@@ -35,5 +35,7 @@ Credentials live on the SERVING machine (`$DSH_HOME` env / `.env`): `wsl`/`ssh` 
 
 ## Credentials and prerequisites
 
+- The serving process does not exit on stdin EOF by itself — the ACP client’s dispose ladder (EOF grace → SIGTERM) terminates it; a bare stdio driver should do the same after use.
+
 - The serving side needs its own provider credentials — nothing flows from the client.
 - `dsh` must resolve on the remote PATH; otherwise wrap it: `args: ['-e', 'bash', '-lc', 'dsh --profile acp']` for WSL (argv is never shell-interpreted locally; the wrapper runs remotely).

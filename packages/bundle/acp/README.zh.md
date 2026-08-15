@@ -14,26 +14,28 @@ base 的 agent 花名册保持为空——agent 随 `session/new` 创建,没有�
 ## 服务与消费
 
 ```bash
-# 服务端(远端机器——裸机、WSL 或 SSH 主机)
+# serve (the remote machine — bare metal, WSL, or an SSH host)
 dsh --profile acp
 
-# 在另一台 dsh 的 TUI 里消费(subagent-acp 作客户端)——加到客户端
-# profile 的 cordis.patch.yml:
+# consume from another dsh's TUI (subagent-acp as the client) — add to the
+# CLIENT profile's cordis.patch.yml:
 - insert:
     - id: subagent-acp
       name: '@deepseek-ai/dsh-subagent-acp'
       config:
         providerName: acp
-        command: wsl                      # 或: ssh
+        command: wsl                      # or: ssh
         args: ['-e', 'dsh', '--profile', 'acp']
         cwdWorld: remote
         cwd: /home/me/project
-        permission: ask                   # 权限询问在客户端的审批界面弹出
+        permission: ask                   # permission asks surface in the client's approval UI
 ```
 
 凭据放在服务端机器上(`$DSH_HOME` 环境变量 / `.env`):`wsl`/`ssh` 传输不转发客户端环境,且 argv 绝不能携带密钥(进程列表全局可读)。
 
 ## 凭据与前置条件
+
+- 服务端进程不会因 stdin EOF 自行退出——由 ACP 客户端的 dispose 阶梯(EOF 宽限→SIGTERM)终止;裸 stdio 驱动方在使用后应同样终止它。
 
 - 服务端需要自己的 provider 凭据——没有任何东西从客户端流过来。
 - 远端 PATH 里必须能解析 `dsh`;否则包一层:WSL 用 `args: ['-e', 'bash', '-lc', 'dsh --profile acp']`(argv 在本地永不经过 shell 解释;包装命令在远端执行)。

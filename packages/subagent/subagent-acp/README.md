@@ -91,10 +91,33 @@ Parent input grows only by the final result or error, which is data-dependent an
 
 Append-only; newly visible content follows the reusable request prefix and does not invalidate existing KV-cache entries.
 
+## Serving a remote dsh (WSL / SSH)
+
+The client composes against any ACP agent; the remote side can be this
+harness itself via the shipped server profile ([`dsh-acp-bundle`](../../bundle/acp)):
+
+```yaml
+- insert:
+    - id: subagent-acp
+      name: '@deepseek-ai/dsh-subagent-acp'
+      config:
+        providerName: acp
+        command: wsl                      # or: ssh
+        args: ['-e', 'dsh', '--profile', 'acp']
+        cwdWorld: remote
+        cwd: /home/me/project
+        permission: ask
+```
+
+Prerequisites: `dsh` resolves on the remote PATH (otherwise wrap with
+`args: ['-e', 'bash', '-lc', 'dsh --profile acp']`), and the SERVING machine
+carries its own provider credentials — `wsl`/`ssh` do not forward the client
+environment, and argv must never carry a key.
+
 ## Known Limitations and Deferred Work
 
 - **A fresh process per run** — persistent-process pooling is a future optimization ([the seam Agent Note](../../../.agents/notes/implemented/feature/2026-06-21-subagent-capability-seam.md)).
-- **Local workspaces only** — the resolved cwd is a local path handed to a child on the same machine; workspace mapping for a remote ACP agent would need its own backend capability and is not designed here.
+- **Remote workspaces need `cwdWorld: remote`** — the default `local` world stats the configured cwd on THIS machine; a `remote` world (a `wsl`/`ssh` transport spawning a `dsh --profile acp` child) validates the cwd syntactically only, requires it (the parent's cwd is local-machine state), and anchors the transport process at the harness cwd while the ACP session names the remote workspace.
 - **No optional start-time capabilities** — this provider cannot apply the local harness's `outputSchema`, depth cap, tool filter, or persona inside the remote process, so it advertises none and the service rejects requests that require them.
 - **Only committed `agent_message_chunk` text is collected** — the automation server keeps reasoning, tool activity, plans, and other trace data in the child session log rather than emitting them on ACP.
-- **Permission prompts are auto-answered** (`permission: allow | reject`) — no human is surfaced a child's `session/request_permission`.
+- **`permission: ask` relays to the parent's approval waterfall** — the ask is attributed to the delegating parent agent under a provider-namespaced tool name (`acp:bash`), so an interactive host (the TUI) shows its approval dialog and the decision flows back to the child; `allow | reject` remain non-interactive.

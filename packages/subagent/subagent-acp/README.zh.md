@@ -91,10 +91,29 @@ ACP 不声明任何启动时能力，因为当前进程无法强制执行远程�
 
 仅追加；新增可见内容位于可复用请求前缀之后，不会使现有 KV Cache 条目失效。
 
+## 服务远端 dsh（WSL / SSH）
+
+客户端可组合任意 ACP agent;远端可以是本 harness 自己——用内置服务端 profile（[`dsh-acp-bundle`](../../bundle/acp)）:
+
+```yaml
+- insert:
+    - id: subagent-acp
+      name: '@deepseek-ai/dsh-subagent-acp'
+      config:
+        providerName: acp
+        command: wsl                      # or: ssh
+        args: ['-e', 'dsh', '--profile', 'acp']
+        cwdWorld: remote
+        cwd: /home/me/project
+        permission: ask
+```
+
+前置条件:远端 PATH 能解析 `dsh`（否则包一层 `args: ['-e', 'bash', '-lc', 'dsh --profile acp']`）,且服务端机器自带 provider 凭据——`wsl`/`ssh` 不转发客户端环境,argv 绝不能携带密钥。
+
 ## 已知限制与暂缓事项
 
 - **每次运行使用全新进程**：持久进程池属于后续优化（见 [seam Agent Note](../../../.agents/notes/implemented/feature/2026-06-21-subagent-capability-seam.md)）。
-- **仅支持本地工作区**：解析后的 cwd 是交给同一台机器上子进程的本地路径；远程 ACP agent 的工作区映射需要独立的后端能力，此处尚未设计这种能力。
+- **远程工作区需 `cwdWorld: remote`**：默认 `local` 世界会在本机 stat 配置的 cwd；`remote` 世界（`wsl`/`ssh` 传输 spawn `dsh --profile acp` 子进程）只做语法校验且必填（父会话 cwd 是本机状态），传输进程锚定在本 harness 进程 cwd，而 ACP 会话指向远端工作区。
 - **不支持可选启动时能力**：该提供方无法在远程进程内应用本地 harness 的 `outputSchema`、深度上限、工具过滤器或 persona，因此不会声明这些能力；服务会拒绝需要它们的请求。
 - **只收集已提交的 `agent_message_chunk` 文本**：自动化服务器把推理（reasoning）、工具活动、计划和其他 trace 数据保留在子 agent 会话日志中，不通过 ACP 发出。
-- **权限提示自动回答**（`permission: allow | reject`）：不会把子 agent 的 `session/request_permission` 呈现给人。
+- **`permission: ask` 中继到父进程审批瀑布**：询问以提供方命名空间的工具名（`acp:bash`）归因到委派父 agent,交互式宿主(TUI)弹出审批对话框、决定回流子 agent;`allow | reject` 仍为非交互。

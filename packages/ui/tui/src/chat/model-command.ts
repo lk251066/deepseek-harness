@@ -25,6 +25,11 @@ import type { ChannelNotice, ChatChannelDeps } from './channel.ts'
 export interface ModelControllerDeps extends ChatChannelDeps, ChannelNotice {
   /** Shared selected-target handle owned by the channel. */
   readonly target: ModelSelectionRef
+  /**
+   * Transient receipt slot for operation feedback (model selected / already
+   * selected); absent falls back to the durable transcript notice.
+   */
+  showTransientNotice?(message: string): void
 }
 
 /** Model-selection controller for one chat channel. */
@@ -108,7 +113,9 @@ export function createModelController(deps: ModelControllerDeps): ModelControlle
       : explicitReasoning.effort
     if (sameRoute && target.current?.reasoningEffort === reasoningEffort) {
       const reasoning = targetReasoningLabel(selected, reasoningEffort)
-      deps.appendNotice(`Model is already ${targetLabel(selected)}${reasoning === undefined ? '' : ` with reasoning effort ${displayText(reasoning)}`}.`)
+      const already = `Model is already ${targetLabel(selected)}${reasoning === undefined ? '' : ` with reasoning effort ${displayText(reasoning)}`}.`
+      if (deps.showTransientNotice === undefined) deps.appendNotice(already)
+      else deps.showTransientNotice(already)
       return
     }
     target.current = {
@@ -118,11 +125,13 @@ export function createModelController(deps: ModelControllerDeps): ModelControlle
     }
     resolveContextWindow(target.current)
     const reasoning = targetReasoningLabel(selected, reasoningEffort)
-    deps.appendNotice([
+    const receipt = [
       `Model selected: ${targetLabel(selected)}.`,
       ...reasoning === undefined ? [] : [`Reasoning effort: ${displayText(reasoning)}.`],
       'New steps will use it.',
-    ].join(' '))
+    ].join(' ')
+    if (deps.showTransientNotice === undefined) deps.appendNotice(receipt)
+    else deps.showTransientNotice(receipt)
   }
 
   const showModelSelector = (choices: readonly ModelChoice[]): void => {

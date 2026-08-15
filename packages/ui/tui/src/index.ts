@@ -140,6 +140,7 @@ import {
 import { createSessionChannel, type SessionChannel } from './chat/session-channel.ts'
 import { createAssistantController } from './chat/assistant.ts'
 import { MEMORY_UNAVAILABLE_LINES, memoryRows } from './chat/memories.ts'
+import { fleetLines } from './chat/fleet.ts'
 // Declaration-merges the optional `memory` service onto `Context`; the TUI
 // reads it per use and never imports the package's runtime code.
 import type { MemoryId } from '@deepseek-ai/dsh-memory'
@@ -738,6 +739,7 @@ export function createTuiChat(
     appendNotice,
     requestRender,
     isDisposed,
+    showTransientNotice,
   })
 
   // Shift+Tab preset ring with the danger-preset risk confirmation overlay.
@@ -1829,6 +1831,15 @@ export function createTuiChat(
           options: { width: 76, anchor: 'center', margin: 1 },
         })
         requestRender()
+        return { kind: 'success' }
+      },
+    })
+    commandCtx.commands.register({
+      name: 'fleet',
+      description: 'Monitor every persisted session in this store (cross-process)',
+      handler: async ({ signal }) => {
+        const lines = await fleetLines(insights, signal)
+        if (!isDisposed()) openStaticDialog(insights, 'Fleet', lines)
         return { kind: 'success' }
       },
     })

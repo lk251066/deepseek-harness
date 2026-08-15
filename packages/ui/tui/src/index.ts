@@ -33,13 +33,11 @@ import type {} from '@deepseek-ai/dsh-agent-loop'
 import type {} from '@deepseek-ai/dsh-token-meter'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, MessageId } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-llm-retry'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import {
-  isReplacementSurfaceEvent,
   SessionId,
-  type SessionEvent,
   type UserMessage,
 } from '@deepseek-ai/dsh-session'
 import { foldGoal } from '@deepseek-ai/dsh-goal'
@@ -76,49 +74,32 @@ import { displayInlineText, displayText } from './components/text.ts'
 import { createCodeHighlighter } from './components/highlight.ts'
 import { brandText, createPalette, markdownTheme, renderPalette, selectTheme } from './components/theme.ts'
 import { THEME_PRESETS, THEME_PRESET_NAMES, type ThemePreset } from './components/theme-presets.ts'
-import { contentText, parseArguments } from './components/content.ts'
 import {
   cacheHitRate,
   formatTokens,
-  recordEventUsage,
-  sessionTokens,
 } from './chat/tokens.ts'
 import {
   fadeGlyph,
   formatQueuedStatus,
   formatStatusDuration,
-  openStepPhase,
-  openTurn,
   pulseLevel,
   runningPhaseGlyph,
-  STATUS_ANIMATION_INTERVAL_MS,
-  STATUS_FADE_MS,
-  TIMING_BUCKET_GLYPHS,
   TOOL_SPINNER_FRAMES,
   TOOL_SPINNER_INTERVAL_MS,
-  type StepPosition,
 } from './chat/timing.ts'
 import {
   resolveTuiConfig,
   type Config,
 } from './config.ts'
 import {
-  CollapsedToolGroupComponent,
   type CondensedHeaderInfo,
-  ContextCardComponent,
   type ToolCardVisibility,
   HeaderComponent,
-  StreamingAssistantComponent,
-  ToolCardComponent,
-  TodoComponent,
-  UserMessageComponent,
 } from './components/transcript.ts'
-import { shortcutHint } from './components/figures.ts'
 import { FramedEditorComponent } from './components/framed-editor.ts'
 import { NoticeSlotComponent, type NoticeKind } from './components/notice-slot.ts'
 import { WorkingLineComponent } from './components/working-line.ts'
 import { logoFullWidth, logoSingleWordWidth, SHIMMER_INTERVAL_MS, SHIMMER_WIDTH } from './components/logo.ts'
-import { pickSpinnerVerb } from './chat/spinner-verbs.ts'
 import { contextPressureLevel } from './chat/context-pressure.ts'
 import {
   compactTargetLabel,
@@ -150,10 +131,8 @@ import {
   formatCwd,
   gitBranch,
   HintEditor,
-  isCompactCheckpoint,
-  sessionReferenceCard,
-  transcriptToolCallIds,
 } from './chat/helpers.ts'
+import { createSessionChannel, type SessionChannel } from './chat/session-channel.ts'
 import {
   createModelController,
   type ModelController,
@@ -321,41 +300,6 @@ const TUI_VERSION: string = (() => {
   }
 })()
 
-/**
- * Transcript row standing in for one compacted range while the full history is
- * rendered (Ctrl+O expanded): the conversation above it stays visible, so the
- * marker only reports where the model stopped seeing that history.
- */
-const COMPACTION_BOUNDARY = '… earlier context was compacted …'
-
-/**
- * Low-signal read/search tools whose adjacent calls collapse into one summary
- * row (Claude Code's collapsed read/search group): the registered names `read`
- * (tool-fs), `grep` and `glob` (tool-fs-search). The harness has no separate
- * `ls`/`list` tool — `glob` owns directory listings.
- */
-const FOLDABLE_TOOLS: ReadonlySet<string> = new Set(['read', 'grep', 'glob'])
-
-/** An adjacent run of foldable calls below this count keeps its standalone cards. */
-const TOOL_GROUP_MIN_CARDS = 3
-
-interface RunningStatus {
-  turn: number | undefined
-  timer: ReturnType<typeof setInterval>
-  /** Render clock when the turn began; origin of the glyph fade-in. */
-  startedAt: number
-  /** The most recently rendered phase glyph, handed to the fade-out. */
-  lastGlyph: string
-}
-
-/** A running glyph fading out after its turn ended, before the caret returns. */
-interface FadingStatus {
-  glyph: string
-  /** Render clock when the turn ended; origin of the glyph fade-out. */
-  endedAt: number
-  timer: ReturnType<typeof setInterval>
-}
-
 /** Width/height adapter for a modal component rendered inside the base TUI flow. */
 class InlineModalComponent extends Container {
   constructor(
@@ -411,7 +355,6 @@ export function createTuiChat(
   const mdTheme = markdownTheme(palette, codeHighlighter.highlightCode)
   codeHighlighter.preload()
   const ui = new TUI(runtime.terminal, resolved.showHardwareCursor)
-  const chat = new Container()
   const todoContainer = new Container()
   const questionContainer = new Container()
   const inputTemplate = parseTuiPromptTemplate(displayInlineText(resolved.theme.inputPrompt))
@@ -429,32 +372,11 @@ export function createTuiChat(
     },
   })
   editor.hintPrefix = initialInputPrompt
-  const todo = new TodoComponent(palette)
   const compactionStatusLine = new Text('', 0, 0)
   let showReasoning = resolved.showReasoning
   // Ctrl+O cycles collapsed -> expanded -> hidden. Codex-style: hidden drops
   // tool cards entirely, collapsed previews, expanded shows full bodies.
   let toolsVisibility: ToolCardVisibility = 'collapsed'
-  let streaming: StreamingAssistantComponent | undefined
-  let completedStreaming: StreamingAssistantComponent | undefined
-  // Assistant step components in model order per turn, for hidden-mode folding:
-  // with tool cards hidden, a turn keeps one Assistant header and later steps
-  // render as headerless continuations (see applyTurnFolding).
-  const assistantSteps = new Map<number, StreamingAssistantComponent[]>()
-  let runningStatus: RunningStatus | undefined
-  let fadingStatus: FadingStatus | undefined
-  /**
-   * Live standalone compaction observed by this process. Never derive this
-   * state from history: a resumed log may contain a stale orphaned start.
-   */
-  let compacting: {
-    startedAt: number
-    timer: ReturnType<typeof setInterval>
-  } | undefined
-  // TUI steering submissions that the inbox has not yet claimed or discarded.
-  // Correlation ids avoid guessing whether a running-state submission actually
-  // joined steering or fell back to the queued-turn FIFO during turn close.
-  const pendingSteering = new Set<MessageId>()
   let disposed = false
   let shuttingDown: Promise<void> | undefined
   // Optional: skills mount conditionally, so read the global service store
@@ -467,22 +389,6 @@ export function createTuiChat(
     excludedDirectories: resolved.fileSearchExcludedDirectories,
   })
   const skillAbort = new AbortController()
-  const tokens = sessionTokens(agent.session)
-  const toolCards = new Map<string, ToolCardComponent>()
-  const allToolCards = new Set<ToolCardComponent>()
-  /** Every collapsed tool group in the transcript, for visibility and animation passes. */
-  const toolGroups = new Set<CollapsedToolGroupComponent>()
-  /**
-   * The run of adjacent foldable calls currently accumulating toward a group:
-   * `cards` holds the member cards (which render standalone in the chat until
-   * the run reaches {@link TOOL_GROUP_MIN_CARDS}), `component` the group row
-   * that replaced them once it does.
-   */
-  let openToolGroup: {
-    cards: ToolCardComponent[]
-    component: CollapsedToolGroupComponent | undefined
-  } | undefined
-  const contextCards = new Set<ContextCardComponent>()
   const liveErrors = new Set<string>()
   const commandControllers = new Set<AbortController>()
   const referenceControllers = new Set<AbortController>()
@@ -572,9 +478,10 @@ export function createTuiChat(
 
   const updatePromptValues = (): void => {
     const renderTime = now()
+    const tokens = channel.tokens()
     cwdValue.set(palette.bold(palette.accent(formattedCwd)))
     gitValue.set(branch === undefined ? undefined : palette.dim(` (${displayText(branch)})`))
-    const rate = cacheHitRate(tokens)
+    const rate = cacheHitRate(channel.tokens())
     const usage = `↑${formatTokens(tokens.input)} ↓${formatTokens(tokens.output)}`
     modelValue.set(`  ${palette.dim(displayText(target.current === undefined ? 'model unset' : compactTargetLabel(target.current)))}`)
     tokenValue.set(`  ${palette.dim(rate === undefined ? usage : `${usage}  cache ${rate}%`)}`)
@@ -600,7 +507,7 @@ export function createTuiChat(
           : palette.dim(percentText)
       contextValue.set(`  ${contextMeter(occupancy, palette)} ${percent}${palette.dim(' context')}`)
     }
-    const queued = runningStatus === undefined ? undefined : formatQueuedStatus(pendingSteering.size)
+    const queued = channel.isRunning() ? undefined : formatQueuedStatus(channel.pendingSteeringCount())
     queuedValue.set(queued === undefined ? undefined : palette.dim(queued))
     // Shift+Tab's preset ring and the plan-mode chip; absent services render nothing.
     const preset = permissionController.chip()
@@ -611,8 +518,8 @@ export function createTuiChat(
     const stats = statsStrip(insights)
     statsValue.set(stats === undefined ? undefined : palette.dim(`  ${stats}`))
     symbolValue.set(palette.bold(palette.accent('dsh')))
-    compactionStatusLine.setText(compacting !== undefined
-      ? palette.dim(`Context being compacted ${formatStatusDuration(renderTime - compacting.startedAt)}`)
+    compactionStatusLine.setText(channel.isCompacting()
+      ? palette.dim(`Context being compacted ${formatStatusDuration(renderTime - (channel.compactingStartedAt() ?? renderTime))}`)
       : occupancy !== undefined && contextPressureLevel(occupancy) === 'critical'
         ? palette.error(`Context low · ${Math.round(occupancy)}% used · run /compact to free space`)
         : '')
@@ -623,22 +530,15 @@ export function createTuiChat(
     // brightness changes, so the cursor never shifts.
     const statusGlyph = runningPhaseGlyph(
       agent.session.events,
-      runningStatus !== undefined,
-      compacting !== undefined,
+      channel.isRunning(),
+      channel.isCompacting(),
     )
-    // Remember the live phase glyph so the fade-out shows it, not the ttft
-    // fallback the derivation returns once the closing turn's step has ended.
-    if (runningStatus !== undefined && statusGlyph !== undefined) runningStatus.lastGlyph = statusGlyph
+    channel.noteRenderedStatusGlyph(statusGlyph)
     // The fade envelope gates appear/disappear; the active throb breathes the
     // glyph throughout the operation. Truecolor opacity is envelope × throb; the
     // non-truecolor fallback keys visibility off the envelope alone, so the
     // throb never blinks it. `envelope` clamps to [0, 1].
-    const activeSince = runningStatus?.startedAt ?? compacting?.startedAt
-    const envelope = activeSince !== undefined && statusGlyph !== undefined
-      ? { glyph: statusGlyph, level: Math.min(1, (renderTime - activeSince) / STATUS_FADE_MS) }
-      : fadingStatus !== undefined
-        ? { glyph: fadingStatus.glyph, level: Math.max(0, 1 - (renderTime - fadingStatus.endedAt) / STATUS_FADE_MS) }
-        : undefined
+    const envelope = channel.statusGlyphEnvelope(statusGlyph, renderTime)
     const caret = envelope === undefined
       ? palette.dim('>')
       : fadeGlyph(
@@ -657,9 +557,7 @@ export function createTuiChat(
     valueName => ctx.tuiPrompt.get(valueName),
   )
   ui.addChild(header)
-  ui.addChild(chat)
   ui.addChild(new Spacer(1))
-  todoContainer.addChild(todo)
   ui.addChild(todoContainer)
   // Docks (goal bar, steering queue) mount into this slot in order once their
   // controllers exist; an empty container renders nothing.
@@ -827,52 +725,70 @@ export function createTuiChat(
     )
   }
 
+  // The per-session chat channel: transcript container, streaming/tool/context
+  // cards, turn status, token totals, and the session-scoped listeners. The
+  // shared chrome below holds the channel's container; every callback it reads
+  // (goal/queue docks, notices, spinner working line) stays live through these
+  // closures.
+  const channel: SessionChannel = createSessionChannel({
+    ctx,
+    agent,
+    resolved,
+    palette,
+    mdTheme,
+    now,
+    terminal: runtime.terminal,
+    requestRender,
+    appendNotice,
+    loadAttachmentImage,
+    addToEditorHistory: (text) => {
+      editor.addToHistory(text)
+    },
+    refreshGoalBar: () => {
+      goalBar.refresh()
+    },
+    refreshQueueDock: () => {
+      refreshQueueDock()
+    },
+    onSessionTitle: (title) => {
+      sessionTitle = title
+      header.invalidate()
+      updateTerminalTitle()
+    },
+    onToolResult: () => {
+      fileSearch.invalidate()
+    },
+    applyStatus: (status) => {
+      setStatus(status)
+    },
+    showReasoning: () => showReasoning,
+    toolsVisibility: () => toolsVisibility,
+    onSpinnerFrame: (running, startedAt, label, frame, extras) => {
+      workingLine.update(running, startedAt, label, frame, extras)
+      requestRender()
+    },
+    onSpinnerIdle: () => {
+      workingLine.update(false, undefined, undefined, undefined)
+      requestRender()
+    },
+    onAgentError: (stepKey, error) => {
+      liveErrors.add(stepKey)
+      // Full cause chain: wrapper messages like `fetch failed` carry the
+      // actionable transport detail on `cause`.
+      appendNotice(errorChain(error), 'error')
+    },
+    onAgentDisposed: () => {
+      appendNotice(`Agent "${agent.id}" was disposed.`, 'warning')
+      disposed = true
+    },
+  })
+  const chat = channel.chat
+  // The transcript container mounts below the header in the shared layout once
+  // the channel exists; `chat` is per-session state living in a shared slot.
+  ui.children.splice(1, 0, chat)
+  todoContainer.addChild(channel.todo)
+
   updatePromptValues()
-
-  const renderStatus = (): void => {
-    streaming?.invalidate()
-    requestRender()
-  }
-
-  /** Stop the turn-phase running and fade-out timers and drop both states. */
-  const clearTurnStatus = (): void => {
-    if (runningStatus !== undefined) {
-      clearInterval(runningStatus.timer)
-      runningStatus = undefined
-    }
-    if (fadingStatus !== undefined) {
-      clearInterval(fadingStatus.timer)
-      fadingStatus = undefined
-    }
-    runtime.terminal.setProgress(compacting !== undefined)
-  }
-
-  /** Hard clear: drop every indicator, including a live compaction bracket. */
-  const clearStatus = (): void => {
-    if (compacting !== undefined) {
-      clearInterval(compacting.timer)
-      compacting = undefined
-    }
-    clearTurnStatus()
-  }
-
-  /**
-   * Hand the last active glyph to a fade-out that re-renders until it settles
-   * on the `>` caret, then stops its own timer. A hard clear (teardown) skips
-   * this via {@link clearStatus}.
-   */
-  const beginFadeOut = (glyph: string): void => {
-    clearTurnStatus()
-    const fading: FadingStatus = {
-      glyph,
-      endedAt: now(),
-      timer: setInterval(() => {
-        if (now() - fading.endedAt >= STATUS_FADE_MS) clearTurnStatus()
-        renderStatus()
-      }, STATUS_ANIMATION_INTERVAL_MS),
-    }
-    fadingStatus = fading
-  }
 
   /** Status-priority placeholder text for the empty editor (dim; the hint editor paints it). */
   const editorHintFor = (status: AgentStatus): string => {
@@ -907,65 +823,17 @@ export function createTuiChat(
   }
 
   const setStatus = (status: AgentStatus): void => {
-    const priorTurn = runningStatus?.turn
-    const fadeOutGlyph = status !== 'running' ? runningStatus?.lastGlyph : undefined
-    if (status === 'running') clearTurnStatus()
-    else if (fadeOutGlyph !== undefined) beginFadeOut(fadeOutGlyph)
-    else clearTurnStatus()
     editor.borderColor = status === 'running' ? text => palette.accent(text) : text => palette.dim(text)
     // Running keeps the steering placeholder; idle plan mode carries its own;
     // plain idle carries the queue hint or the example-commands hint.
     applyEditorHint()
+    channel.setStatus(status)
     if (status === 'running') {
-      const turn = priorTurn ?? openTurn(agent.session.events)
-      const running: RunningStatus = {
-        turn,
-        startedAt: now(),
-        // Seed with the current phase (ttft before the first step opens) so the
-        // fade-out always has a glyph, even for a turn that ends before a render.
-        lastGlyph: TIMING_BUCKET_GLYPHS[openStepPhase(agent.session.events) ?? 'ttft'],
-        // Refresh every tick so the fading prompt phase glyph animates even
-        // before the first token, when no streaming component exists yet.
-        timer: setInterval(renderStatus, STATUS_ANIMATION_INTERVAL_MS),
-      }
-      runningStatus = running
-      runtime.terminal.setProgress(true)
       // Show the working line immediately; the spinner tick takes over on its
       // first frame (≤100 ms later).
-      workingLine.update(true, running.startedAt, undefined, undefined)
+      workingLine.update(true, channel.runningStartedAt(), undefined, undefined)
     }
     requestRender()
-  }
-
-  const refreshStatus = (): void => {
-    renderStatus()
-  }
-
-  const parsedTool = (event: Extract<SessionEvent, { type: 'tool/call' }>): ToolCardComponent => {
-    const parsed = parseArguments(event.data.arguments)
-    const card = new ToolCardComponent(
-      event.data.name,
-      parsed,
-      ctx.tools.get(event.data.name, agent),
-      resolved.maxToolOutputLines,
-      resolved.maxDiffEditLength,
-      palette,
-      mdTheme,
-      event.time,
-    )
-    card.setVisibility(toolsVisibility)
-    toolCards.set(event.data.callId, card)
-    allToolCards.add(card)
-    return card
-  }
-
-  /**
-   * Detach one child from the chat container — the standalone cards a collapsed
-   * group replaces (mirroring `removeStreaming`'s direct children splice).
-   */
-  const removeChatChild = (component: Component): void => {
-    const index = chat.children.indexOf(component)
-    if (index >= 0) chat.children.splice(index, 1)
   }
 
   // One process-wide spinner tick: the newest pending tool card animates its
@@ -974,418 +842,34 @@ export function createTuiChat(
   // idle) the card update is skipped; the working line itself renders empty
   // when idle, so the tick is effectively self-gating.
   let spinnerFrame = 0
-  let workShown = false
-  // Working-line extras: one random fun verb per turn (seeded off the turn
-  // number so the word stays stable within a turn), streamed-token estimate
-  // (chars/4) for the status segment, and the last stream output time for
-  // the stall warning.
-  const verbBase = Date.now() % 997
-  let streamedChars = 0
-  let lastOutputAt: number | undefined
   const spinnerTimer = setInterval(() => {
     if (disposed) return
     const frame = TOOL_SPINNER_FRAMES[spinnerFrame++ % TOOL_SPINNER_FRAMES.length] ?? TOOL_SPINNER_FRAMES[0]
-    let pending: ToolCardComponent | undefined
-    for (const card of allToolCards) {
-      if (card.isPending()) pending = card
-    }
-    const running = runningStatus !== undefined || compacting !== undefined
-    // Idle steady state (nothing pending, nothing running): the previous tick
-    // already rendered the empty line, so skip — this keeps the timer free.
-    if (pending === undefined && !running) {
-      if (workShown) {
-        workShown = false
-        workingLine.update(false, undefined, undefined, undefined)
-        requestRender()
-      }
-      return
-    }
-    workShown = true
-    if (pending !== undefined) pending.setSpinner(frame)
-    // A collapsed group whose newest member pends animates its summary glyph.
-    for (const group of toolGroups) group.setSpinner(frame)
-    workingLine.update(
-      running,
-      runningStatus?.startedAt ?? compacting?.startedAt,
-      pending?.label(),
-      frame,
-      {
-        verb: pickSpinnerVerb(verbBase + (runningStatus?.turn ?? 0)),
-        emittedTokens: Math.floor(streamedChars / 4),
-        ...lastOutputAt === undefined ? {} : { lastOutputAt },
-      },
-    )
-    requestRender()
+    channel.tickSpinner(frame)
   }, TOOL_SPINNER_INTERVAL_MS)
 
-  /**
-   * Re-derive hidden-mode folding for one turn: the first step with a visible
-   * body owns the turn's single Assistant header, every other step renders as a
-   * headerless continuation (empty ones render nothing). Any other visibility
-   * restores the per-step headers.
-   */
-  const applyTurnFolding = (turn: number): void => {
-    const steps = assistantSteps.get(turn)
-    if (steps === undefined) return
-    let headerSeen = false
-    for (const step of steps) {
-      if (toolsVisibility !== 'hidden') {
-        step.setFoldedContinuation(false)
-      } else if (!headerSeen && step.hasVisibleBody()) {
-        headerSeen = true
-        step.setFoldedContinuation(false)
-      } else {
-        step.setFoldedContinuation(true)
-      }
-    }
-  }
-
-  const registerAssistantStep = (component: StreamingAssistantComponent): void => {
-    const steps = assistantSteps.get(component.position.turn) ?? []
-    steps.push(component)
-    assistantSteps.set(component.position.turn, steps)
-    applyTurnFolding(component.position.turn)
-  }
-
-  const removeStreaming = (current: StreamingAssistantComponent | undefined): void => {
-    if (current === undefined) return
-    const index = chat.children.indexOf(current)
-    /* v8 ignore next -- streaming components are retained only while attached to the chat. */
-    if (index >= 0) chat.children.splice(index, 1)
-    const steps = assistantSteps.get(current.position.turn)
-    /* v8 ignore next -- every attached streaming component is registered in the fold map. */
-    if (steps === undefined) return
-    const stepIndex = steps.indexOf(current)
-    /* v8 ignore next -- registration precedes attachment, so the component is present until this removal. */
-    if (stepIndex < 0) return
-    steps.splice(stepIndex, 1)
-    // A retracted step may have owned the turn's hidden-mode header.
-    applyTurnFolding(current.position.turn)
-  }
-
-  const clearStreaming = (): void => {
-    removeStreaming(streaming)
-    streaming = undefined
-  }
-
-  const retractFailedStreaming = (): void => {
-    removeStreaming(streaming ?? completedStreaming)
-    streaming = undefined
-    completedStreaming = undefined
-  }
-
-  const startAssistantStep = (position: StepPosition, startedAt?: number): void => {
-    streaming = new StreamingAssistantComponent(
-      position,
-      showReasoning,
-      palette,
-      mdTheme,
-    )
-    streaming.markStart(startedAt)
-    registerAssistantStep(streaming)
-    chat.addChild(streaming)
-  }
-
-  const renderEvent = (
-    event: SessionEvent,
-    options: {
-      addHistory: boolean
-      renderChunks: boolean
-    },
-  ): void => {
-    // Foldable grouping: a run of adjacent low-signal calls ends at any event
-    // that renders something else or moves the conversation along. A
-    // `tool/result` inserts no component of its own (results flow into the
-    // existing cards), so it keeps the run open — a batch's calls land
-    // consecutively and their results follow without breaking the group they
-    // formed.
-    if (
-      event.type !== 'tool/result'
-      && !(event.type === 'tool/call' && FOLDABLE_TOOLS.has(event.data.name))
-    ) {
-      openToolGroup = undefined
-    }
-    switch (event.type) {
-      case 'user/message': {
-        // Injected context (plugin/goal source) renders as a dim context card,
-        // not a human bubble; only a direct human prompt is a user message. The
-        // boolean avoids narrowing `source`, so the label keeps its full union.
-        const source = event.data.source
-        if (source.kind !== 'user') {
-          const references = sessionReferenceCard(event.data.source)
-          if (references !== undefined) {
-            chat.addChild(new Spacer(1))
-            chat.addChild(new Text(palette.dim(`Referenced sessions · ${references.map(displayText).join(', ')}`), 0, 0))
-            break
-          }
-          const text = contentText(event.data.content).trim()
-          /* v8 ignore next -- context events with empty content are rejected by their owning producers. */
-          if (text) {
-            // The tui type view lacks plugin-augmented source kinds (e.g. goal),
-            // so read the display label without narrowing on `kind`. The session
-            // log is a durable/replay boundary: a corrupt or foreign injected
-            // source may not match the typed shape, so fall back to `context`.
-            const labelled = source as { kind?: unknown; plugin?: unknown }
-            const label = typeof labelled.plugin === 'string' ? labelled.plugin
-              : typeof labelled.kind === 'string' ? labelled.kind
-                : 'context'
-            const card = new ContextCardComponent(label, text, resolved.maxToolOutputLines, palette)
-            card.setExpanded(toolsVisibility === 'expanded')
-            contextCards.add(card)
-            chat.addChild(new Spacer(1))
-            chat.addChild(card)
-          }
-          break
-        }
-        const text = displayText(contentText(event.data.content).trim())
-        const images = event.data.content
-          .filter((block): block is Extract<ContentBlock, { type: 'image' }> => block.type === 'image')
-          .map(block => ({ attachmentId: String(block.attachment.attachmentId), mediaType: block.attachment.mediaType }))
-        if (text || images.length > 0) {
-          chat.addChild(new Spacer(1))
-          chat.addChild(new UserMessageComponent(text, palette, images, loadAttachmentImage))
-          if (options.addHistory && text) editor.addToHistory(text)
-        }
-        break
-      }
-      case 'step/start':
-        startAssistantStep(event.data, event.time)
-        break
-      case 'assistant/chunk':
-        // Working-line extras: every streamed character feeds the token
-        // estimate and refreshes the stall clock, regardless of whether this
-        // pass renders the chunk.
-        {
-          const chunk = event.data.chunk
-          if (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta') streamedChars += chunk.text.length
-          lastOutputAt = event.time
-        }
-        if (options.renderChunks && streaming !== undefined) {
-          streaming.update(event.data.chunk)
-          // The first streamed text/reasoning may make this step the turn's
-          // hidden-mode header owner (or a continuation with a visible body).
-          applyTurnFolding(streaming.position.turn)
-        }
-        break
-      case 'assistant/message':
-        completedStreaming = undefined
-        // A settled component stays attached but never absorbs a later message
-        // of the same step; both the live and replay paths start a new one.
-        if (streaming === undefined || streaming.isSettled() || !chat.children.includes(streaming)) {
-          startAssistantStep(event.data, event.time)
-        }
-        if (streaming !== undefined) {
-          streaming.settle(event.data.message.content, event.time)
-          applyTurnFolding(streaming.position.turn)
-        }
-        break
-      case 'llm/retry': {
-        retractFailedStreaming()
-        const retryLimit = event.data.mode === 'always' ? '∞' : String(event.data.maxRetries)
-        appendNotice(
-          `Retrying model request (${event.data.retry}/${retryLimit}) in ${event.data.delayMs}ms: ${event.data.failure.message}`,
-          'warning',
-        )
-        break
-      }
-      // No external Spacer for tool cards: the card renders its own leading
-      // gap, so the hidden state removes the row and the gap together.
-      case 'tool/call': {
-        const card = parsedTool(event)
-        if (!FOLDABLE_TOOLS.has(event.data.name)) {
-          chat.addChild(card)
-          break
-        }
-        const group = openToolGroup
-        if (group === undefined) {
-          chat.addChild(card)
-          openToolGroup = { cards: [card], component: undefined }
-          break
-        }
-        group.cards.push(card)
-        if (group.component === undefined) {
-          // Below the threshold the run renders as standalone cards; the call
-          // that reaches it swaps the whole run for one group row.
-          chat.addChild(card)
-          if (group.cards.length < TOOL_GROUP_MIN_CARDS) break
-          for (const member of group.cards) removeChatChild(member)
-          const component = new CollapsedToolGroupComponent(group.cards, palette)
-          component.setVisibility(toolsVisibility)
-          toolGroups.add(component)
-          chat.addChild(component)
-          group.component = component
-        } else {
-          group.component.add(card)
-        }
-        break
-      }
-      case 'tool/result': {
-        const callId = event.data.message.source.callId
-        let card = toolCards.get(callId)
-        if (card === undefined) {
-          card = new ToolCardComponent(
-            'tool',
-            { value: {}, valid: true },
-            undefined,
-            resolved.maxToolOutputLines,
-            resolved.maxDiffEditLength,
-            palette,
-            mdTheme,
-            event.time,
-          )
-          card.setVisibility(toolsVisibility)
-          chat.addChild(card)
-          allToolCards.add(card)
-          // The orphan fallback is its own card component, so a following
-          // foldable call must not join a run across it.
-          openToolGroup = undefined
-        }
-        card.updateResult(event.data, event.time)
-        toolCards.delete(callId)
-        // A member's result changes every group summary that reads it (settled
-        // glyph, pending hint); drop their cached rows.
-        for (const group of toolGroups) group.refresh()
-        break
-      }
-      case 'todo/write':
-        todo.update(event.data.todos)
-        break
-      case 'turn/start':
-        // Plan strip is turn-scoped: keep it after turn/end for reading, clear on the next turn.
-        todo.update([])
-        streamedChars = 0
-        lastOutputAt = undefined
-        break
-      case 'session/title':
-        sessionTitle = event.data.title
-        header.invalidate()
-        updateTerminalTitle()
-        break
-      case 'step/end':
-        if (streaming === undefined) startAssistantStep(event.data, event.time)
-        completedStreaming = streaming
-        streaming = undefined
-        break
-      // Every turn/end kind presents why the agent stopped: `completed` is
-      // presented by the settled assistant message and its Completed timing
-      // header; every other kind appends an explicit notice.
-      case 'turn/end': {
-        clearStreaming()
-        const reason = event.data.reason
-        switch (reason.kind) {
-          case 'completed':
-            break
-          case 'error': {
-            appendNotice(reason.error.message, 'error')
-            break
-          }
-          case 'aborted':
-            appendNotice('Turn cancelled.', 'warning')
-            break
-          case 'max-tokens':
-            appendNotice('The model reached its output-token limit.', 'warning')
-            break
-          case 'interrupted':
-            appendNotice('The previous process ended during this turn.', 'warning')
-            break
-          default:
-            // TurnEndReasonMap is merge-extensible: a plugin-added outcome
-            // still names why the agent stopped rather than ending silently.
-            appendNotice(`Turn ended: ${(reason as { kind: string }).kind}.`, 'warning')
-            break
-        }
-        break
-      }
-      default:
-        break
-    }
-  }
-
-  /**
-   * Transcript row at a landed compaction boundary: one dim line naming how
-   * much history folded away (Claude Code's boundary convention) instead of
-   * re-rendering the replaced conversation above it.
-   */
-  const renderCompactionFold = (foldedMessages: number): void => {
-    chat.addChild(new Spacer(1))
-    chat.addChild(new Text(palette.dim(
-      `⋯ ${foldedMessages} earlier message${foldedMessages === 1 ? '' : 's'} compacted ${shortcutHint('ctrl+o', 'expand')}`,
-    ), 0, 0))
-  }
-
-  /** The static boundary marker one checkpoint renders in expanded replay. */
-  const renderCompactionBoundary = (): void => {
-    chat.addChild(new Spacer(1))
-    chat.addChild(new Text(palette.dim(COMPACTION_BOUNDARY), 0, 0))
-  }
-
-  /**
-   * The log index of the LAST landed compaction checkpoint, or `-1` when the
-   * session never compacted. Only the last boundary matters: any earlier one
-   * sits inside the range it folds.
-   */
-  const lastCompactCheckpointIndex = (events: readonly SessionEvent[]): number => {
-    let boundary = -1
-    for (const [index, event] of events.entries()) {
-      if (isCompactCheckpoint(event)) boundary = index
-    }
-    return boundary
-  }
-
-  /**
-   * Replay the human transcript from the append-only log. The conversation a
-   * compaction replaced folds away at its last boundary (Claude Code's
-   * behavior): the transcript renders only the post-boundary events plus one
-   * dim fold row counting the dropped messages, while Ctrl+O's expanded phase
-   * restores the full history (every checkpoint then marks its own boundary
-   * row, the pre-fold layout). Everything else is append-origin and renders
-   * in log order.
-   *
-   * The `tool/call` pairing check has no live counterpart, because only replay
-   * can meet an orphan: `tool/call` carries no `surfaceOp` of its own, so it
-   * inherits transcript membership from the `assistant/message` that advertised
-   * it, which the live listener has necessarily just rendered. A loaded log is a
-   * replay boundary, so the pairing is re-derived here instead of assumed.
-   */
   const rebuildTranscript = (populateHistory: boolean): void => {
-    chat.clear()
-    toolCards.clear()
-    allToolCards.clear()
-    toolGroups.clear()
-    openToolGroup = undefined
-    contextCards.clear()
-    assistantSteps.clear()
-    streaming = undefined
-    todo.update([])
-    const transcriptCalls = transcriptToolCallIds(agent.session)
-    const events = agent.session.events
-    const boundary = toolsVisibility === 'expanded' ? -1 : lastCompactCheckpointIndex(events)
-    let foldedMessages = 0
-    for (const [index, event] of events.entries()) {
-      if (isReplacementSurfaceEvent(event)) {
-        if (isCompactCheckpoint(event)) {
-          // The last checkpoint owns the fold row; in expanded replay (no
-          // fold, boundary -1) every checkpoint marks its own range instead.
-          if (index === boundary) renderCompactionFold(foldedMessages)
-          else if (boundary === -1) renderCompactionBoundary()
-        }
-        continue
-      }
-      if (index < boundary) {
-        // Folded range: nothing renders, but a resumed session's prompt
-        // history still learns its prompts, the way the unfolded replay did.
-        if (event.type === 'user/message' && event.data.source.kind === 'user') {
-          foldedMessages += 1
-          const text = displayText(contentText(event.data.content).trim())
-          /* v8 ignore next -- an image-only folded prompt carries no history text to learn. */
-          if (populateHistory && text) editor.addToHistory(text)
-        }
-        continue
-      }
-      if (event.type === 'tool/call' && !transcriptCalls.has(event.data.callId)) continue
-      renderEvent(event, { addHistory: populateHistory, renderChunks: false })
-    }
-    requestRender()
+    channel.rebuildTranscript(populateHistory)
+  }
+  const applyTurnFolding = (turn: number): void => {
+    channel.applyTurnFolding(turn)
+  }
+  const clearStatus = (): void => {
+    channel.clearStatus()
+  }
+  const setToolsVisibility = (next: ToolCardVisibility): void => {
+    toolsVisibility = next
+    // The compact history fold keys off the expanded phase, so a session that
+    // ever compacted re-derives its transcript on every phase switch: expanded
+    // restores the folded history, the other phases fold it again. The loops
+    // below then re-apply the phase to the rebuilt components idempotently.
+    if (channel.hasCompactionCheckpoint()) rebuildTranscript(false)
+    channel.applyToolsVisibility(toolsVisibility)
+    // Hidden mode folds each turn's steps into one assistant message; other
+    // modes restore the per-step Assistant headers.
+    for (const turn of channel.assistantStepTurns()) applyTurnFolding(turn)
+    // State-switch feedback: transient receipt, not transcript history.
+    showTransientNotice(toolsVisibility === 'hidden' ? 'Tool cards hidden.' : `Tool and context cards ${toolsVisibility}.`)
   }
 
   const questions = createQuestionQueue({
@@ -1424,7 +908,7 @@ export function createTuiChat(
         runtime.terminal.rows - editorRows,
       ))
     },
-    pendingCallLabel: callId => callId === undefined ? undefined : toolCards.get(callId)?.label(),
+    pendingCallLabel: callId => channel.toolCardLabel(callId),
   })
 
   const resume = createResumeController({
@@ -1559,27 +1043,6 @@ export function createTuiChat(
   // same reason.
   ui.queryTerminalColorScheme({ timeoutMs: 2000 }).catch(() => {})
 
-  const setToolsVisibility = (next: ToolCardVisibility): void => {
-    toolsVisibility = next
-    // The compact history fold keys off the expanded phase, so a session that
-    // ever compacted re-derives its transcript on every phase switch: expanded
-    // restores the folded history, the other phases fold it again. The loops
-    // below then re-apply the phase to the rebuilt components idempotently.
-    if (lastCompactCheckpointIndex(agent.session.events) >= 0) rebuildTranscript(false)
-    for (const card of allToolCards) card.setVisibility(toolsVisibility)
-    // Group rows ride the same cycle: hidden drops the summary, expanded lists
-    // the member cards (the loop above already set their own visibility).
-    for (const group of toolGroups) group.setVisibility(toolsVisibility)
-    // Context cards carry injected instructions rather than tool traffic, so
-    // they never hide: the hidden phase reads as their collapsed preview.
-    for (const card of contextCards) card.setExpanded(toolsVisibility === 'expanded')
-    // Hidden mode folds each turn's steps into one assistant message; other
-    // modes restore the per-step Assistant headers.
-    for (const turn of assistantSteps.keys()) applyTurnFolding(turn)
-    // State-switch feedback: transient receipt, not transcript history.
-    showTransientNotice(toolsVisibility === 'hidden' ? 'Tool cards hidden.' : `Tool and context cards ${toolsVisibility}.`)
-  }
-
   const toggleTools = (): void => {
     // The cycle order puts the two common reading modes adjacent: preview ->
     // full detail -> conversation-only, then back to the preview default.
@@ -1589,14 +1052,11 @@ export function createTuiChat(
 
   const setReasoning = (show: boolean): void => {
     showReasoning = show
-    const activeStreaming = streaming
+    const activeStreaming = channel.detachStreaming()
     rebuildTranscript(false)
     /* v8 ignore next -- the non-streaming command path is covered; this branch preserves an active stream across rebuild. */
     if (activeStreaming !== undefined) {
-      streaming = activeStreaming
-      streaming.setShowReasoning(showReasoning)
-      registerAssistantStep(activeStreaming)
-      chat.addChild(activeStreaming)
+      channel.restoreStreaming(activeStreaming)
     }
     // State-switch feedback: transient receipt, not transcript history.
     showTransientNotice(`Reasoning ${showReasoning ? 'expanded' : 'collapsed'}.`)
@@ -1770,6 +1230,7 @@ export function createTuiChat(
       const contextPercent = Math.round(usedContext / contextWindow * 100)
       context = `${diagnosticMeter(contextPercent, palette)} ${String(contextPercent)}% used (${formatDiagnosticNumber(usedContext)} / ${formatDiagnosticNumber(contextWindow)})`
     }
+    const tokens = channel.tokens()
     const rate = cacheHitRate(tokens)
     const turns = events.filter(event => event.type === 'turn/start').length
     const steps = events.filter(event => event.type === 'step/start').length
@@ -2099,8 +1560,7 @@ export function createTuiChat(
     const message = createUserMessage({ content, source: { kind: 'user' } })
     if (agent.status === 'running') {
       agent.steer(message)
-      pendingSteering.add(message.id)
-      refreshStatus()
+      channel.addPendingSteering(message.id)
     } else {
       agent.followup(message)
     }
@@ -2216,17 +1676,17 @@ export function createTuiChat(
       editor.setText('')
       const replacement = replaceQueuedMessage(editTarget, [{ type: 'text', text }])
       if (agent.inbox.replace(editTarget.id, replacement)) {
-        pendingSteering.add(replacement.id)
+        channel.addPendingSteering(replacement.id)
         showTransientNotice('Queued message updated.')
       } else if (agent.status === 'running') {
         // The target left the queue while editing; deliver as fresh steering.
         agent.steer(replacement)
-        pendingSteering.add(replacement.id)
+        channel.addPendingSteering(replacement.id)
       } else {
         agent.followup(replacement)
       }
       refreshQueueDock()
-      refreshStatus()
+      channel.refreshStatus()
       return
     }
     // `/skill:<name>` carries a colon, which the command registry's name
@@ -2354,95 +1814,10 @@ export function createTuiChat(
     return undefined
   })
 
-  const disposeSessionEvents = ctx.on('session/event', (session, event) => {
-    if (session !== agent.session) return
-    if (event.type === 'tool/result') fileSearch.invalidate()
-    recordEventUsage(tokens, event)
-    if (event.type === 'turn/start' && runningStatus !== undefined) runningStatus.turn = event.data.turn
-    // Docks re-derive from the log: the goal bar on goal changes, the queue
-    // dock on inbox-affecting events; plan-mode switches re-derive the hint.
-    if (event.type === 'goal/change' || event.type === 'turn/start') goalBar.refresh()
-    if (event.type === 'agent/inbox/spliced' || event.type === 'user/message') refreshQueueDock()
-    if (event.type === 'plan/mode' || event.type === 'permission/preset') setStatus(agent.status)
-    // Track live standalone compaction state.
-    if (event.type === 'compaction/start' && event.data.turn === null) {
-      if (compacting === undefined) {
-        const startedAt = now()
-        compacting = {
-          startedAt,
-          timer: setInterval(renderStatus, STATUS_ANIMATION_INTERVAL_MS),
-        }
-        runtime.terminal.setProgress(true)
-      }
-      requestRender()
-      return
-    }
-    if (event.type === 'compaction/end' && event.data.turn === null && compacting !== undefined) {
-      const fadeOutGlyph = runningPhaseGlyph(agent.session.events, false, true)
-      clearInterval(compacting.timer)
-      compacting = undefined
-      if (event.data.error !== undefined) {
-        appendNotice(`Compaction failed: ${event.data.error}`, 'warning')
-      }
-      // A concurrently running turn owns the indicator. Keep its timer and
-      // progress bit instead of letting the compaction fade clear that state.
-      if (runningStatus === undefined && fadeOutGlyph !== undefined) beginFadeOut(fadeOutGlyph)
-      requestRender()
-      return
-    }
-    // A replacement mutates only the model surface, so the rendered transcript
-    // keeps what it already showed; a landed summary checkpoint folds the
-    // history it replaced, so the transcript is re-derived from the log rather
-    // than patched in place — the fold removes components already attached.
-    if (isReplacementSurfaceEvent(event)) {
-      if (isCompactCheckpoint(event)) rebuildTranscript(false)
-      requestRender()
-      return
-    }
-    renderEvent(event, { addHistory: false, renderChunks: true })
-    requestRender()
-  })
-  const settlePendingSteering = (id: MessageId): void => {
-    if (pendingSteering.delete(id)) refreshStatus()
-  }
-  const disposeDequeued = ctx.on('agent/inbox/claimed', ({ agent: source, message }) => {
-    if (source === agent) settlePendingSteering(message.id)
-  })
-  const disposeDiscarded = ctx.on('agent/inbox/discarded', ({ agent: source, message }) => {
-    if (source !== agent) return
-    if (pendingSteering.delete(message.id)) refreshStatus()
-  })
-  const disposeInserted = ctx.on('agent/inbox/inserted', ({ agent: source }) => {
-    if (source === agent) refreshQueueDock()
-  })
-  const disposeStatus = ctx.on('agent/status', ({ agent: source, status }) => {
-    if (source !== agent) return
-    // Leaving 'running' ends the turn's status line; clear any badge so the
-    // next running turn starts from zero (and a cancellation, which discards
-    // the queue without logging drains, cannot strand a stale count).
-    if (status !== 'running') pendingSteering.clear()
-    setStatus(status)
-  })
-  const disposeError = ctx.on('agent/error', ({ agent: source, turn, step, error }) => {
-    if (source !== agent) return
-    liveErrors.add(`${turn}:${step}`)
-    // Full cause chain: wrapper messages like `fetch failed` carry the
-    // actionable transport detail on `cause`.
-    appendNotice(errorChain(error), 'error')
-  })
-  const disposeAgent = ctx.on('agent/disposed', ({ agent: source }) => {
-    if (source !== agent) return
-    // The agent left the registry (e.g. an agent-loop-only reload) while the
-    // TUI stays mounted. Retained agents accept deliveries after detachment, so
-    // without this a later send would drive a zombie agent/session; mark
-    // disposed so dispatchMessage reports it instead.
-    // The hard clear also retires live compaction. A later compact/end is
-    // intentionally presentation-silent: this disposal notice owns the
-    // terminal outcome, and no animation may survive agent detachment.
-    clearStatus()
-    appendNotice(`Agent "${agent.id}" was disposed.`, 'warning')
-    disposed = true
-  })
+  // Every session-scoped listener (session events, inbox/status/error/disposed)
+  // lives on the mounted channel; the shared chrome registers and unregisters
+  // them with the channel itself.
+  channel.attach()
 
   const detachListeners = (): void => {
     skillAbort.abort()
@@ -2455,13 +1830,7 @@ export function createTuiChat(
     for (const value of promptValues) value.dispose()
     stopBannerReveal()
     stopLogoShimmer()
-    disposeSessionEvents()
-    disposeDequeued()
-    disposeDiscarded()
-    disposeInserted()
-    disposeStatus()
-    disposeError()
-    disposeAgent()
+    channel.detach()
     disposeSchemeListener()
     disposeTargetListeners()
     modelController.detach()

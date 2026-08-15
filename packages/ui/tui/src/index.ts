@@ -138,7 +138,8 @@ import {
   HintEditor,
 } from './chat/helpers.ts'
 import { createSessionChannel, type SessionChannel } from './chat/session-channel.ts'
-import { createAssistantController } from './chat/assistant.ts'
+import { createAssistantController, ASSISTANT_SESSION_ID } from './chat/assistant.ts'
+import { createAssistantLayout, type AssistantLayoutController } from './chat/assistant-layout.ts'
 import { MEMORY_UNAVAILABLE_LINES, memoryRows } from './chat/memories.ts'
 import { fleetLines } from './chat/fleet.ts'
 // Declaration-merges the optional `memory` service onto `Context`; the TUI
@@ -931,9 +932,17 @@ export function createTuiChat(
 
   /** Wire one slot's components into the shared chrome and start its listeners. */
   const mountSlot = (slot: TuiSessionSlot): void => {
-    // The transcript mounts below the header; chat is per-session state living
-    // in this shared index-1 slot.
-    ui.children.splice(1, 0, slot.channel.chat)
+    // Special handling for assistant: use split-view layout with session list
+    if (slot.sessionId === ASSISTANT_SESSION_ID) {
+      assistantLayout.splitLayout.setLeftPane(assistantLayout.sessionList)
+      assistantLayout.splitLayout.setRightPane(slot.channel.chat)
+      assistantLayout.refresh()
+      // Mount the split layout instead of just the chat
+      ui.children.splice(1, 0, assistantLayout.splitLayout)
+    } else {
+      // Normal sessions: mount chat directly (traditional full-width layout)
+      ui.children.splice(1, 0, slot.channel.chat)
+    }
     todoContainer.addChild(slot.channel.todo)
     docks.addChild(slot.goalBar.component)
     docks.addChild(slot.queueDock.component)
@@ -943,8 +952,15 @@ export function createTuiChat(
   /** Unwire one slot's components and stop its session listeners (switch-away). */
   const unmountSlot = (slot: TuiSessionSlot): void => {
     slot.channel.detach()
-    const chatIndex = ui.children.indexOf(slot.channel.chat)
-    if (chatIndex >= 0) ui.children.splice(chatIndex, 1)
+    if (slot.sessionId === ASSISTANT_SESSION_ID) {
+      // Unmount the split layout
+      const splitIndex = ui.children.indexOf(assistantLayout.splitLayout)
+      if (splitIndex >= 0) ui.children.splice(splitIndex, 1)
+    } else {
+      // Normal sessions: unmount chat directly
+      const chatIndex = ui.children.indexOf(slot.channel.chat)
+      if (chatIndex >= 0) ui.children.splice(chatIndex, 1)
+    }
     todoContainer.clear()
     docks.clear()
   }
@@ -1079,6 +1095,15 @@ export function createTuiChat(
     appendNotice,
     showTransientNotice,
     isDisposed,
+  })
+
+  // The assistant hub split-view layout: left pane shows session list, right
+  // pane shows the assistant chat. Only active when assistant is mounted.
+  const assistantLayout: AssistantLayoutController = createAssistantLayout({
+    palette,
+    registry,
+    terminalRows: () => runtime.terminal.rows,
+    requestRender,
   })
 
   updatePromptValues()
@@ -2072,6 +2097,38 @@ export function createTuiChat(
 
   const removeInputListener = ui.addInputListener((data) => {
     if (overlayManager.hasActiveOverlay()) return undefined
+
+    // Assistant split-view navigation: only active when assistant is mounted
+    if (assistantLayout.isActive()) {
+      // Left arrow: focus session list (navigate mode)
+      if (matchesKey(data, Key.left)) {
+        // Focus shifts to session list (implicit: editor loses focus)
+        assistantLayout.refresh()
+        requestRender()
+        return { consume: true }
+      }
+      // Up/Down in session list navigation
+      if (matchesKey(data, Key.up) && !editor.focused) {
+        assistantLayout.selectPrevious()
+        return { consume: true }
+      }
+      if (matchesKey(data, Key.down) && !editor.focused) {
+        assistantLayout.selectNext()
+        return { consume: true }
+      }
+      // Enter: switch to selected session
+      if (matchesKey(data, Key.enter) && !editor.focused) {
+        assistantLayout.switchToSelected()
+        return { consume: true }
+      }
+      // Right arrow or Esc: return focus to editor
+      if ((matchesKey(data, Key.right) || matchesKey(data, Key.escape)) && !editor.focused) {
+        ui.setFocus(editor)
+        requestRender()
+        return { consume: true }
+      }
+    }
+
     // Empty-input ↑ with queued messages pops the newest queued message back
     // into the editor (Claude Code's queue editing): the next submit REPLACES
     // it through the same armed-edit path the /queue sheet uses. With nothing
@@ -2095,6 +2152,11 @@ export function createTuiChat(
     }
     if (matchesKey(data, Key.ctrl('g'))) {
       goalBar.showActions()
+      return { consume: true }
+    }
+    // Ctrl+H returns to the assistant hub (from any session)
+    if (matchesKey(data, Key.ctrl('h'))) {
+      assistant.open()
       return { consume: true }
     }
     // Ctrl+N starts a fresh in-process session and switches to it (the /new

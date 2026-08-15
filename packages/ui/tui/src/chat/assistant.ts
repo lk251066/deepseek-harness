@@ -14,6 +14,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { PERSONA_ORDER, PERSONA_SECTION } from '@deepseek-ai/dsh-system-prompt'
 import type { TuiSessionSlot } from '../index.ts'
 import type { ChannelRegistry } from './channel-registry.ts'
+import { installAssistantTools } from './assistant-tools.ts'
 
 /** The assistant's fixed session id — stable across processes by design. */
 export const ASSISTANT_SESSION_ID = SessionId('assistant')
@@ -27,16 +28,19 @@ export const ASSISTANT_PERSONA = [
   '你是这个用户的个人助手,由 {{model}} 模型驱动。',
   '你有跨对话的持久记忆:回答任何关于用户偏好、背景或过往约定的问题之前,先用 memory_search 检索;',
   '当用户陈述值得长期记住的事实或偏好时,主动调用 memory_save 保存——一条记忆只写一件独立的事,已列出的不重复保存。',
+  '你可以监控和协助其他会话:用 list_sessions 查看所有活跃会话的状态,用 send_message_to_session 给指定会话发送消息。',
+  '当用户要求"监控某会话"或"盯着XX会话"时,定期调用 list_sessions 检查状态,发现问题主动汇报或协助。',
   '回答简洁。技术或编程请求照常处理,可以使用常规工具;但不要默认进入大型编码流程,先弄清用户想要什么。',
 ].join('')
 
 /**
  * Install the assistant's scoped world on one (unpublished) agent context: the
  * persona shadow plus, when the memory service is mounted, its tools and the
- * auto-recalled memories section.
+ * auto-recalled memories section, plus the assistant-specific session control tools.
  * @param agentCtx - the agent scope `setup` receives.
+ * @param registry - the multi-session registry for session control tools.
  */
-export function setupAssistant(agentCtx: Context): void {
+export function setupAssistant(agentCtx: Context, registry: ChannelRegistry<TuiSessionSlot>): void {
   agentCtx.inject(['systemPrompt', 'tools'], (promptCtx: Context) => {
     promptCtx.systemPrompt.section({
       name: PERSONA_SECTION,
@@ -46,6 +50,8 @@ export function setupAssistant(agentCtx: Context): void {
     // Optional by design: without the memory plugin the assistant is still a
     // persona-shifted session, never a broken one.
     promptCtx.get('memory')?.installTools(promptCtx)
+    // Install assistant-specific session control tools
+    installAssistantTools(promptCtx, registry)
   })
 }
 
@@ -108,7 +114,10 @@ export function createAssistantController(deps: AssistantControllerDeps): { open
     }
     if (await persisted()) {
       try {
-        const handle = await ctx.agents.resume({ resumeSessionId: ASSISTANT_SESSION_ID, setup: setupAssistant })
+        const handle = await ctx.agents.resume({
+          resumeSessionId: ASSISTANT_SESSION_ID,
+          setup: agentCtx => setupAssistant(agentCtx, registry),
+        })
         if (deps.isDisposed()) return
         adopt(handle.agent, 'Assistant session resumed.')
         return
@@ -126,7 +135,7 @@ export function createAssistantController(deps: AssistantControllerDeps): { open
         sessionId: ASSISTANT_SESSION_ID,
         seed: [],
         meta: { cwd: deps.cwd },
-        setup: setupAssistant,
+        setup: agentCtx => setupAssistant(agentCtx, registry),
       })
       if (deps.isDisposed()) return
       adopt(handle.agent, 'Assistant session created.')

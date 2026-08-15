@@ -47,7 +47,7 @@ export interface TuiHarnessOptions {
   omitWelcome?: boolean
   tools?: Record<string, ToolDefinition>
   configureContext?: (ctx: Context) => Promise<void>
-  beforeMount?: (session: Session) => void
+  beforeMount?: (session: Session, ctx: Context) => void
   cwd?: string | null
   formatCwd?: TuiRuntime['formatCwd']
   gitBranch?: TuiRuntime['gitBranch']
@@ -195,7 +195,7 @@ export async function createTuiTestHarness<TerminalType extends Terminal, Exit e
     })
     session.append('step/start', { turn: 1, step: 1 })
   }
-  options.beforeMount?.(session)
+  options.beforeMount?.(session, ctx)
   const sent: ContentBlock[][] = []
   const sentMessages: UserMessage[] = []
   const steered: ContentBlock[][] = []

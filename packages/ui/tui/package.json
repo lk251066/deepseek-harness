@@ -41,6 +41,7 @@
     "@deepseek-ai/dsh-invariants": "workspace:^",
     "@deepseek-ai/dsh-llm": "workspace:^",
     "@deepseek-ai/dsh-llm-retry": "workspace:^",
+    "@deepseek-ai/dsh-memory": "workspace:^",
     "@deepseek-ai/dsh-session": "workspace:^",
     "@deepseek-ai/dsh-session-persistence": "workspace:^",
     "@deepseek-ai/dsh-session-projection": "workspace:^",
@@ -64,6 +65,9 @@
     },
     "@deepseek-ai/dsh-skill": {
       "optional": true
+    },
+    "@deepseek-ai/dsh-memory": {
+      "optional": true
     }
   },
   "dependencies": {
@@ -85,6 +89,7 @@
     "@deepseek-ai/dsh-invariants": "workspace:^",
     "@deepseek-ai/dsh-llm": "workspace:^",
     "@deepseek-ai/dsh-llm-retry": "workspace:^",
+    "@deepseek-ai/dsh-memory": "workspace:^",
     "@deepseek-ai/dsh-permission-presets": "workspace:^",
     "@deepseek-ai/dsh-plan-mode": "workspace:^",
     "@deepseek-ai/dsh-session": "workspace:^",

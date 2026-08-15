@@ -70,6 +70,11 @@
       config:
         backend: json
 
+    # Durable long-term user memory (the assistant's memory_save/memory_search
+    # tools and its auto-recalled prompt section read this store).
+    - id: memory
+      name: '@deepseek-ai/dsh-memory'
+
 
     # The keyboard-backed provider behind ask_user_question and the plan-mode
     # review, and the front door it renders inside.

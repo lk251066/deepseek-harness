@@ -136,6 +136,11 @@ import {
   HintEditor,
 } from './chat/helpers.ts'
 import { createSessionChannel, type SessionChannel } from './chat/session-channel.ts'
+import { createAssistantController } from './chat/assistant.ts'
+import { MEMORY_UNAVAILABLE_LINES, memoriesLines } from './chat/memories.ts'
+// Declaration-merges the optional `memory` service onto `Context`; the TUI
+// reads it per use and never imports the package's runtime code.
+import type {} from '@deepseek-ai/dsh-memory'
 import {
   createChannelRegistry,
   DEFAULT_MAX_LIVE_SLOTS,
@@ -338,7 +343,7 @@ export interface TuiController {
  * agent-scoped listeners (model routing, the @-file prompt section). Built by
  * the slot factory, swapped under the shared chrome by the channel registry.
  */
-interface TuiSessionSlot extends SessionSlot {
+export interface TuiSessionSlot extends SessionSlot {
   /** Transcript channel: chat container, todo strip, session listeners. */
   readonly channel: SessionChannel
   /** The goal dock (Ctrl+G actions) for this session. */
@@ -1057,6 +1062,25 @@ export function createTuiChat(
         if (!disposed) appendNotice(`New session failed: ${errorChain(error)}`, 'error')
       },
     )
+  }
+
+  // The personal assistant (`/assistant`): a fixed-id session with its own
+  // persona and the memory tools, resumed across processes when its log
+  // exists. Memory stays optional — without the plugin the assistant is a
+  // persona-shifted session and `/memories` reports the gap.
+  const assistant = createAssistantController({
+    ctx,
+    registry,
+    cwd,
+    appendNotice,
+    showTransientNotice,
+    isDisposed,
+  })
+
+  /** The `/memories` panel rows, re-read per refresh. */
+  const memoryLines = (): readonly string[] => {
+    const memory = ctx.get('memory')
+    return memory === undefined ? MEMORY_UNAVAILABLE_LINES : memoriesLines(memory.list())
   }
 
   updatePromptValues()
@@ -1782,6 +1806,24 @@ export function createTuiChat(
       name: 'new',
       description: 'Start a fresh session in this terminal and switch to it',
       handler: () => { newSession(); return { kind: 'success' } },
+    })
+    commandCtx.commands.register({
+      name: 'assistant',
+      description: 'Switch to the personal assistant (resumes across restarts, keeps long-term memory)',
+      handler: () => { assistant.open(); return { kind: 'success' } },
+    })
+    commandCtx.commands.register({
+      name: 'memories',
+      description: 'Browse the assistant\'s long-term memories',
+      handler: () => {
+        const memory = ctx.get('memory')
+        if (memory === undefined) {
+          appendNotice(MEMORY_UNAVAILABLE_LINES[0] ?? 'Memory is not available in this composition.', 'warning')
+          return { kind: 'success' }
+        }
+        openStaticDialog(insights, 'Memories', [...memoryLines()], () => [...memoryLines()])
+        return { kind: 'success' }
+      },
     })
   })
   // The @-file reference prompt section registers per-slot (on each agent's

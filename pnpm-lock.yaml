@@ -1271,6 +1271,9 @@ importers:
 
   packages/bundle/tui:
     dependencies:
+      '@deepseek-ai/dsh-memory':
+        specifier: workspace:^
+        version: link:../../context/memory
       '@deepseek-ai/dsh-session-projection-cache':
         specifier: workspace:^
         version: link:../../session/session-projection-cache
@@ -8027,6 +8030,9 @@ importers:
       '@deepseek-ai/dsh-llm-retry':
         specifier: workspace:^
         version: link:../../llm/llm-retry
+      '@deepseek-ai/dsh-memory':
+        specifier: workspace:^
+        version: link:../../context/memory
       '@deepseek-ai/dsh-permission-presets':
         specifier: workspace:^
         version: link:../../interaction/permission-presets

@@ -1,6 +1,8 @@
 packages:
   - vendor/*
   - packages/*/*
+  # External TUI plugin for local development
+  - ../dsh-tui-pro/packages/*
   # The Landlock launcher is developed with its harness consumers but keeps
   # its native build and publication scripts under native/landlock-run.
   - native/landlock-run

@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/feature/2026-08-15-personal-assistant-and-memory.md
-2026-08-15-personal-assistant-and-memory.md: ca351f1ccda3f9b030cfcfaad7284d713bc0ad6c
-2026-08-15-personal-assistant-and-memory.zh.md: 559022395bace12f9f2ff6709a19fda515576ed9
+2026-08-15-personal-assistant-and-memory.md: de9726801db8f3fe34165a68c98a7ccfbd987189
+2026-08-15-personal-assistant-and-memory.zh.md: 57666d65cecc19d99b66d9b62410ef718faaad2a

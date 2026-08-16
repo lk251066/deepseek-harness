@@ -16,7 +16,13 @@ Status: implemented
 
 **助手是固定 id 会话,靠 setup 契约续命。** `/assistant`(chat/assistant.ts)按从快到慢三条分支解析:注册表里已有槽位直接切换;agent 存活但被 LRU 逐出则重新 adopt;否则做一次只读头的持久化预检(`sessionPersistence.list()`),决定 resume(`ctx.agents.resume({resumeSessionId: 'assistant', setup})`,跨进程延续同一段对话)还是 create。两条路径都跑同一个 `setupAssistant`:以同名替换规则 shadow `deployment:persona` 装上助手人设,并经可选服务装上记忆工具——resume 契约(setup 必须重跑)正是人设跨重启存活的原因。resume 被拒且消息匹配 `not found`(预检与 resume 之间被人删除)时回退 create 一次;其余失败以通知报告。
 
+**助手可以协调存活会话注册表。** 助手作用域注册 `list_sessions`,返回存活状态和活动元数据;注册 `send_message_to_session`,通过目标 agent 的普通 follow-up 收件箱追加带来源的 relay 用户消息。普通编码会话看不到这些工具及其 prompt 指引。已持久化但未存活的会话仍由 `/resume` 负责,不属于 `list_sessions` 的含义。
+
 **依赖只朝一个方向流动。** TUI 依赖 agent 注册表、通道注册表和可选服务;dsh-memory 依赖 storage-domain 与 tools。助手控制器不持有任何记忆引用——插件缺席时助手是一个换了人设的普通会话,`/memories` 报告缺口。
+
+## 考虑过的替代方案
+
+向所有编码会话注册会话控制工具,会让普通项目 agent 获得不需要的协调权限。让助手直接操作已持久化但未存活的会话,会重复 `/resume` 的职责并绕过存活 agent 的收件箱,因此协调范围只覆盖当前进程的注册表。后台助手守护进程需要另一套生命周期,不属于终端进程模型。
 
 ## 影响
 

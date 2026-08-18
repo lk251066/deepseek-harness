@@ -1,8 +1,8 @@
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { describe, expect, it } from 'vitest'
+import { createUserMessage, ReasoningEffortId, type LlmModelReasoningInfo } from '@deepseek-ai/dsh-llm'
+import { describe, expect, it, vi } from 'vitest'
 import { Context, symbols, type EffectMeta } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
-import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
+import AgentRegistry, { installModelSelection, type Agent, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
@@ -32,9 +32,9 @@ async function mountInvariants(ctx: Context): Promise<void> {
  * The parent is a real config agent; the spawn provider creates a real child
  * agent on the same context and we assert its output.
  */
-async function setup(script: Script) {
+async function setup(script: Script, reasoning?: LlmModelReasoningInfo) {
   const ctx = new Context()
-  const adapter = new MockAdapter(script)
+  const adapter = new MockAdapter(script, reasoning)
   await mountAgentLoopTestDependencies(ctx)
   await mountInvariants(ctx)
   await ctx.plugin(AgentLoop, { agents: [] })
@@ -73,6 +73,129 @@ describe('dsh-subagent-spawn-in-process', () => {
     expect(result.stopReason).toBe('completed')
     expect(text(result.output)).toBe('child answer')
     await run.dispose()
+  })
+
+  it('inherits the route and explicit reasoning from the parent request that delegated it', async () => {
+    const reasoning = {
+      efforts: [{ id: ReasoningEffortId('high'), name: 'High' }],
+    }
+    const { ctx, parent, adapter } = await setup([
+      textResponse('parent answer'),
+      textResponse('child answer'),
+    ], reasoning)
+    const selected: ModelSelectionRef = {
+      current: { provider: 'mock', model: 'selected-model', reasoningEffort: ReasoningEffortId('high') },
+      assembled: undefined,
+    }
+    installModelSelection(parent.ctx, selected)
+    parent.followup(createUserMessage({
+      content: [{ type: 'text', text: 'choose the route' }],
+      source: { kind: 'user' },
+    }))
+    await parent.whenIdle()
+
+    const run = await start(ctx, 'spawn', { prompt: [{ type: 'text', text: 'delegate' }], parent })
+    await run.result
+
+    expect(ctx.agents.get(run.id)?.options).toMatchObject({ provider: 'mock', model: 'selected-model' })
+    expect(adapter.requests[1]).toMatchObject({
+      provider: 'mock',
+      model: 'selected-model',
+      reasoningEffort: ReasoningEffortId('high'),
+    })
+    await run.dispose()
+  })
+
+  it('does not copy parent reasoning when an explicit child route differs', async () => {
+    const reasoning = {
+      efforts: [{ id: ReasoningEffortId('high'), name: 'High' }],
+    }
+    const { ctx, parent, adapter } = await setup([
+      textResponse('parent answer'),
+      textResponse('child answer'),
+    ], reasoning)
+    const selected: ModelSelectionRef = {
+      current: { provider: 'mock', model: 'parent-model', reasoningEffort: ReasoningEffortId('high') },
+      assembled: undefined,
+    }
+    installModelSelection(parent.ctx, selected)
+    parent.followup(createUserMessage({ content: [{ type: 'text', text: 'prepare' }], source: { kind: 'user' } }))
+    await parent.whenIdle()
+
+    const run = await start(ctx, 'spawn', {
+      prompt: [{ type: 'text', text: 'different route' }],
+      parent,
+      agentOptions: { provider: 'mock', model: 'child-model' },
+    })
+    await run.result
+
+    expect(adapter.requests[1]).toMatchObject({ provider: 'mock', model: 'child-model' })
+    expect(adapter.requests[1]?.reasoningEffort).toBeUndefined()
+    await run.dispose()
+  })
+
+  it('leaves an adapter-owned parent reasoning default implicit in the child', async () => {
+    const reasoning = {
+      efforts: [{ id: ReasoningEffortId('high'), name: 'High' }],
+      defaultEffort: ReasoningEffortId('high'),
+    }
+    const { ctx, parent } = await setup([
+      textResponse('parent answer'),
+      textResponse('child answer'),
+    ], reasoning)
+    parent.followup(createUserMessage({ content: [{ type: 'text', text: 'prepare' }], source: { kind: 'user' } }))
+    await parent.whenIdle()
+
+    const run = await start(ctx, 'spawn', { prompt: [{ type: 'text', text: 'delegate' }], parent })
+    await run.result
+    const childHeader = ctx.agents.get(run.id)?.session.requestHeader()
+
+    expect(parent.session.requestHeader()?.adapterDefaults).toEqual({ reasoningEffort: true })
+    expect(childHeader?.config.reasoningEffort).toBe(ReasoningEffortId('high'))
+    expect(childHeader?.adapterDefaults).toEqual({ reasoningEffort: true })
+    await run.dispose()
+  })
+
+  it('propagates the captured selection through nested spawn children', async () => {
+    const reasoning = {
+      efforts: [{ id: ReasoningEffortId('high'), name: 'High' }],
+    }
+    const controller = new AbortController()
+    const { ctx, parent, adapter } = await setup([
+      textResponse('parent answer'),
+      'hang',
+      textResponse('grandchild answer'),
+    ], reasoning)
+    const selected: ModelSelectionRef = {
+      current: { provider: 'mock', model: 'nested-model', reasoningEffort: ReasoningEffortId('high') },
+      assembled: undefined,
+    }
+    installModelSelection(parent.ctx, selected)
+    parent.followup(createUserMessage({ content: [{ type: 'text', text: 'prepare' }], source: { kind: 'user' } }))
+    await parent.whenIdle()
+
+    const childRun = await start(ctx, 'spawn', {
+      prompt: [{ type: 'text', text: 'stay busy' }],
+      parent,
+      signal: controller.signal,
+    })
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(2) })
+    const child = ctx.agents.get(childRun.id)!
+    const grandchildRun = await start(ctx, 'spawn', {
+      prompt: [{ type: 'text', text: 'nested work' }],
+      parent: child,
+    })
+    await grandchildRun.result
+
+    expect(adapter.requests[2]).toMatchObject({
+      provider: 'mock',
+      model: 'nested-model',
+      reasoningEffort: ReasoningEffortId('high'),
+    })
+    await grandchildRun.dispose()
+    controller.abort('test complete')
+    await childRun.result
+    await childRun.dispose()
   })
 
   it('emits subagent/start only after the fresh child is published', async () => {

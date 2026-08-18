@@ -24,7 +24,7 @@ import {
   captureDelegatedPolicyOverrides,
   childSessionMeta,
   finalAssistantOutput,
-  resolveChildAgentOptions,
+  resolveChildAgentConfiguration,
   resolveChildDepth,
 } from '@deepseek-ai/dsh-subagent'
 import type {
@@ -111,6 +111,7 @@ export async function startInProcessRun(
   const childId = SessionId(randomUUID())
   const seed = options.seed
   const activationBoundary = seed?.length ?? 0
+  const childConfiguration = resolveChildAgentConfiguration(parent, request.agentOptions, childDepth)
 
   // Capture before the first await: a later parent switch belongs to the
   // parent's future.
@@ -122,6 +123,7 @@ export async function startInProcessRun(
     applyChildComposition(childCtx, parent, {
       persona: request.persona,
       toolFilter: request.toolFilter,
+      modelSelection: childConfiguration.modelSelection,
     })
     if (request.outputSchema !== undefined) {
       structured = attachStructuredRuntime(childCtx, request.outputSchema)
@@ -133,7 +135,7 @@ export async function startInProcessRun(
     sessionId: childId,
     meta: childSessionMeta(parent, childDepth, activationBoundary),
     ...seed !== undefined ? { seed } : {},
-    agentOptions: resolveChildAgentOptions(parent, request.agentOptions, childDepth),
+    agentOptions: childConfiguration.agentOptions,
     signal: request.signal,
     setup,
   })

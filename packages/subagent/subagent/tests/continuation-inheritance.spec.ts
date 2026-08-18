@@ -11,10 +11,10 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import { installModelSelection, type Agent, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId, type LlmModelReasoningInfo } from '@deepseek-ai/dsh-llm'
 import SandboxPolicyService, { effectiveSandboxMode, setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
@@ -35,7 +35,7 @@ afterEach(async () => {
 })
 
 /** Boot the continuable stack plus both policy services the manager consumes opportunistically. */
-async function setup(script: Script) {
+async function setup(script: Script, reasoning?: LlmModelReasoningInfo) {
   const ctx = new Context()
   contexts.push(ctx)
   await mountAgentLoopTestDependencies(ctx)
@@ -48,9 +48,10 @@ async function setup(script: Script) {
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
   await ctx.plugin(SubagentFork, { providerName: 'fork' })
-  ctx.llm.registerAdapter(['mock'], new MockAdapter(script))
+  const adapter = new MockAdapter(script, reasoning)
+  ctx.llm.registerAdapter(['mock'], adapter)
   const parent = ctx.agentLoop.create(SessionId('parent'), { provider: 'mock', model: 'mock' })
-  return { ctx, parent }
+  return { ctx, parent, adapter }
 }
 
 function startSpec(parent: Agent, provider = 'spawn') {
@@ -227,5 +228,65 @@ describe('continuable policy inheritance', () => {
       { data: { mode: 'read-only', source: 'delegation' } },
     ])
     expect(effectiveSandboxMode(loaded.events)).toBe('read-only')
+  })
+
+  it('persists the delegating request selection and restores it on cold resume', { timeout: 20_000 }, async () => {
+    const reasoning = {
+      efforts: [
+        { id: ReasoningEffortId('high'), name: 'High' },
+        { id: ReasoningEffortId('max'), name: 'Max' },
+      ],
+    }
+    const { ctx, parent, adapter } = await setup([
+      textResponse('parent prepared'),
+      textResponse('child first turn'),
+      textResponse('parent settlement'),
+      textResponse('child resumed'),
+    ], reasoning)
+    const selected: ModelSelectionRef = {
+      current: { provider: 'mock', model: 'selected-model', reasoningEffort: ReasoningEffortId('high') },
+      assembled: undefined,
+    }
+    installModelSelection(parent.ctx, selected)
+    parent.followup(createUserMessage({ content: [{ type: 'text', text: 'prepare' }], source: { kind: 'user' } }))
+    await parent.whenIdle()
+
+    const started = await ctx.subagents.startContinuable(startSpec(parent))
+    selected.current = {
+      provider: 'mock',
+      model: 'selected-model',
+      reasoningEffort: ReasoningEffortId('max'),
+    }
+    await waitNoActivation(ctx, started.childId)
+    await parent.whenIdle()
+
+    const firstLoad = await ctx.sessionPersistence.load(started.childId)
+    expect(firstLoad.events.find(event => event.type === 'subagent/descriptor')?.data).toMatchObject({
+      agentProvider: 'mock',
+      agentModel: 'selected-model',
+      agentReasoningEffort: ReasoningEffortId('high'),
+    })
+    expect(adapter.requests.slice(0, 3).map(request => request.reasoningEffort)).toEqual([
+      ReasoningEffortId('high'),
+      ReasoningEffortId('high'),
+      ReasoningEffortId('max'),
+    ])
+    expect(parent.session.requestHeader()?.config.reasoningEffort).toBe(ReasoningEffortId('max'))
+
+    ctx.on('agent/pre-step', async ({ agent: subject }, next) => {
+      if (subject !== parent) return next()
+      return { kind: 'reject' as const }
+    })
+    await ctx.subagents.followup(parent, started.childId, [{ type: 'text', text: 'continue' }], {
+      source: { kind: 'user' },
+      signal: new AbortController().signal,
+    })
+    await waitNoActivation(ctx, started.childId)
+
+    expect(adapter.requests[3]).toMatchObject({
+      provider: 'mock',
+      model: 'selected-model',
+      reasoningEffort: ReasoningEffortId('high'),
+    })
   })
 })

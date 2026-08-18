@@ -1,8 +1,8 @@
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { describe, expect, it } from 'vitest'
+import { createUserMessage, ReasoningEffortId, type LlmModelReasoningInfo } from '@deepseek-ai/dsh-llm'
+import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
-import AgentRegistry from '@deepseek-ai/dsh-agent'
+import AgentRegistry, { installModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
@@ -39,16 +39,17 @@ const emptyStop: StreamChunk[] = [{ type: 'finish', reason: { kind: 'stop' } }]
  * `session/created`, so a malformed (unbalanced) fork seed makes these tests
  * THROW — that is the regression guard for the completed-turn-prefix boundary.
  */
-async function setup(script: Script) {
+async function setup(script: Script, reasoning?: LlmModelReasoningInfo) {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   await mountInvariants(ctx)
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(SubagentRuntime)
   await ctx.plugin(fork, { providerName: 'fork' })
-  ctx.llm.registerAdapter(['mock'], new MockAdapter(script))
+  const adapter = new MockAdapter(script, reasoning)
+  ctx.llm.registerAdapter(['mock'], adapter)
   const parent = ctx.agentLoop.create(SessionId('parent'), { provider: 'mock', model: 'mock' })
-  return { ctx, parent }
+  return { ctx, parent, adapter }
 }
 
 function text(blocks: { type: string; text?: string }[]): string {
@@ -154,6 +155,51 @@ describe('dsh-subagent-fork-in-process', () => {
     // 1 from the seeded parent turn + 1 from the child's own completed turn.
     expect(seedTurnEnds.length).toBe(2)
 
+    parent.cancel({ kind: 'user' })
+    await run.dispose()
+  })
+
+  it('uses the open delegating request selection instead of the older fork seed', async () => {
+    const reasoning = {
+      efforts: [
+        { id: ReasoningEffortId('high'), name: 'High' },
+        { id: ReasoningEffortId('max'), name: 'Max' },
+      ],
+    }
+    const { ctx, parent, adapter } = await setup([
+      textResponse('completed parent turn'),
+      'hang',
+      textResponse('fork child'),
+    ], reasoning)
+    const selected: ModelSelectionRef = {
+      current: { provider: 'mock', model: 'selected-model', reasoningEffort: ReasoningEffortId('high') },
+      assembled: undefined,
+    }
+    installModelSelection(parent.ctx, selected)
+    parent.followup(createUserMessage({ content: [{ type: 'text', text: 'completed' }], source: { kind: 'user' } }))
+    await parent.whenIdle()
+    selected.current = {
+      provider: 'mock',
+      model: 'selected-model',
+      reasoningEffort: ReasoningEffortId('max'),
+    }
+    parent.followup(createUserMessage({ content: [{ type: 'text', text: 'delegating turn' }], source: { kind: 'user' } }))
+    await vi.waitFor(() => { expect(adapter.requests).toHaveLength(2) })
+
+    const run = await start(ctx, 'fork', { prompt: [{ type: 'text', text: 'fork now' }], parent })
+    await run.result
+    const child = ctx.agents.get(run.id)!
+    const seedLength = child.session.header.seedLength!
+    const seededHeader = child.session.events.slice(0, seedLength)
+      .findLast(event => event.type === 'request/header')
+    const childHeader = child.session.events.slice(seedLength)
+      .find(event => event.type === 'request/header')
+
+    expect(seededHeader?.type === 'request/header' && seededHeader.data.header.config.reasoningEffort)
+      .toBe(ReasoningEffortId('high'))
+    expect(childHeader?.type === 'request/header' && childHeader.data.header.config.reasoningEffort)
+      .toBe(ReasoningEffortId('max'))
+    expect(adapter.requests[2]?.reasoningEffort).toBe(ReasoningEffortId('max'))
     parent.cancel({ kind: 'user' })
     await run.dispose()
   })

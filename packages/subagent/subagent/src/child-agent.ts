@@ -9,7 +9,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent, AgentOptions, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
+import { installModelSelection, type Agent, type AgentOptions, type CreateAgentOptions, type ModelSelection } from '@deepseek-ai/dsh-agent'
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { ToolRestriction } from '@deepseek-ai/dsh-tools'
@@ -57,29 +57,60 @@ export function resolveChildDepth(parent: Agent, maxDepth: number | undefined): 
 }
 
 /**
- * Resolve the child's `AgentOptions`: the parent's provider/model/maxTokens
- * route unless the request overrides it, stamped with the child's own
- * delegation depth.
- * @param parent - the delegating parent whose route the child inherits.
- * @param requested - per-child overrides, if any.
- * @param childDepth - the resolved delegation depth to stamp.
- * @returns the resolved options for `ctx.agents.create()`.
+ * The route and explicit reasoning selection captured for one child creation.
+ * The selection is fixed in the child scope so its first request cannot restore
+ * a stale parent header or an adapter-materialized default.
  */
-export function resolveChildAgentOptions(
+export interface ChildAgentConfiguration {
+  /** Options passed to the agent factory. */
+  readonly agentOptions: AgentOptions
+  /** Exact route plus explicit effort, when the route is complete. */
+  readonly modelSelection?: ModelSelection
+}
+
+/**
+ * Resolve one child from the parent's latest logged request. A request header
+ * is authoritative once present; creation options are only the pre-request
+ * fallback. Explicit child route fields override that route. Reasoning is
+ * copied only for the same final route and only when it was not materialized
+ * by the adapter as a default.
+ * @param parent - the delegating parent whose latest request is captured.
+ * @param requested - explicit child route and per-child options.
+ * @param childDepth - the resolved delegation depth to stamp.
+ * @returns the factory options and fixed model selection for the child.
+ */
+export function resolveChildAgentConfiguration(
   parent: Agent,
   requested: AgentOptions | undefined,
   childDepth: number,
-): AgentOptions {
-  const parentProvider = parent.options.provider
-  const parentModel = parent.options.model
-  const parentMaxTokens = parent.options.maxTokens
-  return {
-    ...parentProvider !== undefined ? { provider: parentProvider } : {},
-    ...parentModel !== undefined ? { model: parentModel } : {},
-    ...parentMaxTokens !== undefined ? { maxTokens: parentMaxTokens } : {},
+): ChildAgentConfiguration {
+  const persistedHeader = parent.session.requestHeader()
+  const persistedConfig = persistedHeader?.config
+  const options: AgentOptions = {
+    ...persistedConfig?.provider !== undefined
+      ? { provider: persistedConfig.provider }
+      : parent.options.provider !== undefined ? { provider: parent.options.provider } : {},
+    ...persistedConfig?.model !== undefined
+      ? { model: persistedConfig.model }
+      : parent.options.model !== undefined ? { model: parent.options.model } : {},
+    ...parent.options.maxTokens !== undefined ? { maxTokens: parent.options.maxTokens } : {},
     ...requested,
     subagentDepth: childDepth,
   }
+  const provider = options.provider
+  const model = options.model
+  if (provider === undefined || model === undefined) return { agentOptions: options }
+  const modelSelection = {
+    provider,
+    model,
+    ...persistedConfig?.provider === provider
+      && persistedConfig.model === model
+      && persistedHeader?.adapterDefaults?.reasoningEffort !== true
+      && persistedConfig.reasoningEffort !== undefined
+      ? { reasoningEffort: persistedConfig.reasoningEffort }
+      : {},
+  }
+  return { agentOptions: options, modelSelection }
 }
 
 /**
@@ -125,6 +156,8 @@ export interface ChildComposition {
   readonly persona?: string | undefined
   /** Per-child tool scoping. */
   readonly toolFilter?: ToolRestriction | undefined
+  /** Fixed route and explicit reasoning captured at delegation time. */
+  readonly modelSelection?: ModelSelection | undefined
 }
 
 /**
@@ -166,6 +199,9 @@ export function applyChildComposition(
   composition: ChildComposition,
 ): void {
   childCtx.get('agentPresets')?.composeFrom(childCtx, parent.ctx)
+  if (composition.modelSelection !== undefined) {
+    installModelSelection(childCtx, { current: composition.modelSelection, assembled: undefined })
+  }
   // Order 120: after the sandbox:policy (110) and approval:policy (115) sentences.
   childCtx.systemPrompt.context({ name: 'subagent:delegation', order: 120, text: SUBAGENT_DELEGATION_CONTEXT })
   if (composition.persona !== undefined) {

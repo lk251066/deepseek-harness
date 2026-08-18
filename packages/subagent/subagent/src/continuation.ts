@@ -35,7 +35,6 @@ import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-ll
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
-import type { ToolRestriction } from '@deepseek-ai/dsh-tools'
 import { foldSubagentDescriptor, snapshotSubagentDescriptor } from './descriptor.ts'
 import type { SubagentDescriptorData } from './descriptor.ts'
 import {
@@ -43,10 +42,10 @@ import {
   applyChildComposition,
   captureDelegatedPolicyOverrides,
   childSessionMeta,
-  resolveChildAgentOptions,
+  resolveChildAgentConfiguration,
   resolveChildDepth,
 } from './child-agent.ts'
-import type { DelegatedPolicyOverrides } from './child-agent.ts'
+import type { ChildComposition, DelegatedPolicyOverrides } from './child-agent.ts'
 import { assertSubagentMaxDepth } from './depth.ts'
 import { seedDescriptorTurn } from './descriptor-seed.ts'
 import type { ContinuableCreateRequest, ContinuableCreateSpec, SubagentResult, SubagentStartRequest } from './types.ts'
@@ -256,7 +255,7 @@ interface MaterializeInputs {
     delegatedPolicies: DelegatedPolicyOverrides
   }
   agentOptions: AgentOptions
-  composition: { persona?: string | undefined; toolFilter?: ToolRestriction | undefined }
+  composition: ChildComposition
   signal: AbortSignal
 }
 
@@ -408,16 +407,19 @@ export class SubagentContinuationManager {
     assertSubagentMaxDepth(request.maxDepth)
     const childId = SessionId(randomUUID())
     const childDepth = resolveChildDepth(parent, request.maxDepth)
+    const childConfiguration = resolveChildAgentConfiguration(parent, request.agentOptions, childDepth)
     // Snapshot before any await: invalid descriptor JSON rejects the call
     // before a child exists, and the detached value is what reaches the log.
-    const agentProvider = request.agentOptions?.provider ?? parent.options.provider
-    const agentModel = request.agentOptions?.model ?? parent.options.model
+    const agentProvider = childConfiguration.agentOptions.provider
+    const agentModel = childConfiguration.agentOptions.model
+    const agentReasoningEffort = childConfiguration.modelSelection?.reasoningEffort
     const descriptor = snapshotSubagentDescriptor({
       mode: 'continuable',
       provider: spec.provider,
       label: spec.label,
       ...agentProvider !== undefined ? { agentProvider } : {},
       ...agentModel !== undefined ? { agentModel } : {},
+      ...agentReasoningEffort !== undefined ? { agentReasoningEffort } : {},
       ...request.persona !== undefined ? { persona: request.persona } : {},
       ...request.toolFilter !== undefined ? { toolFilter: request.toolFilter } : {},
     })
@@ -441,8 +443,12 @@ export class SubagentContinuationManager {
         provider: spec.provider,
         parent,
         create: { seed, meta: childSessionMeta(parent, childDepth, lineageSeedLength), delegatedPolicies },
-        agentOptions: resolveChildAgentOptions(parent, request.agentOptions, childDepth),
-        composition: { persona: request.persona, toolFilter: request.toolFilter },
+        agentOptions: childConfiguration.agentOptions,
+        composition: {
+          persona: request.persona,
+          toolFilter: request.toolFilter,
+          modelSelection: childConfiguration.modelSelection,
+        },
         signal: spec.signal,
       })
       return this.submitMaterialized(
@@ -910,6 +916,15 @@ export class SubagentContinuationManager {
         'NOT_RESUMABLE',
       )
     }
+    const modelSelection = descriptor.agentProvider !== undefined && descriptor.agentModel !== undefined
+      ? {
+        provider: descriptor.agentProvider,
+        model: descriptor.agentModel,
+        ...descriptor.agentReasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: descriptor.agentReasoningEffort },
+      }
+      : undefined
     let activation: Activation
     try {
       activation = await this.materialize({
@@ -920,7 +935,11 @@ export class SubagentContinuationManager {
           ...descriptor.agentProvider !== undefined ? { provider: descriptor.agentProvider } : {},
           ...descriptor.agentModel !== undefined ? { model: descriptor.agentModel } : {},
         },
-        composition: { persona: descriptor.persona, toolFilter: descriptor.toolFilter },
+        composition: {
+          persona: descriptor.persona,
+          toolFilter: descriptor.toolFilter,
+          modelSelection,
+        },
         signal: options.signal,
       })
     } catch (error: unknown) {

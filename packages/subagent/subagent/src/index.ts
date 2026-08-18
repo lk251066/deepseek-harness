@@ -105,11 +105,11 @@ export {
   applyChildComposition,
   captureDelegatedPolicyOverrides,
   childSessionMeta,
-  resolveChildAgentOptions,
+  resolveChildAgentConfiguration,
   resolveChildDepth,
   SubagentDepthError,
 } from './child-agent.ts'
-export type { ChildComposition, DelegatedPolicyOverrides } from './child-agent.ts'
+export type { ChildAgentConfiguration, ChildComposition, DelegatedPolicyOverrides } from './child-agent.ts'
 export type {
   ContinuableStart,
   ContinuableStartSpec,
